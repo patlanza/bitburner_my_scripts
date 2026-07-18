@@ -282,7 +282,14 @@ function getExecutionHosts(ns, servers, reserveHome) {
         if (freeRam > 0) hosts.push({ host, freeRam });
     }
 
-    return hosts.sort((a, b) => b.freeRam - a.freeRam);
+    // Aprovecha primero la RAM remota y deja home para el final. Además de
+    // conservar recursos locales, hace que los servidores con root trabajen
+    // siempre que la operación necesite hilos suficientes.
+    return hosts.sort((a, b) => {
+        if (a.host === HOME && b.host !== HOME) return 1;
+        if (b.host === HOME && a.host !== HOME) return -1;
+        return b.freeRam - a.freeRam;
+    });
 }
 
 /**
@@ -316,6 +323,7 @@ async function deployWorkers(ns, script, target, requestedThreads, hosts, script
 
         pids.push(pid);
         remaining -= threads;
+        log(ns, `DESPLIEGUE: ${host} ejecuta ${script} con ${threads} hilo(s).`);
     }
 
     return pids;
