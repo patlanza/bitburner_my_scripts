@@ -82,17 +82,18 @@ export async function main(ns) {
         `INFO: ${ns.getScriptName()} iniciado. ` +
         `Usa "tail ${ns.getScriptName()}" para ver su actividad.`,
     );
+    log(ns, "Coordinador iniciado.");
 
     while (true) {
-        ns.clearLog();
+        log(ns, "──────── Nuevo ciclo ────────");
 
         const servers = discoverServers(ns);
         const rooted = rootServers(ns, servers);
-        if (rooted > 0) ns.print(`ROOT: acceso obtenido en ${rooted} servidor(es).`);
+        if (rooted > 0) log(ns, `ROOT: acceso obtenido en ${rooted} servidor(es).`);
 
         const target = chooseTarget(ns, servers, String(options.target));
         if (!target) {
-            ns.print("No hay ningún objetivo hackeable disponible.");
+            log(ns, "No hay ningún objetivo hackeable disponible.");
             await ns.sleep(5000);
             continue;
         }
@@ -107,7 +108,7 @@ export async function main(ns) {
         );
 
         if (capacity < 1) {
-            ns.print("No hay RAM libre suficiente para ejecutar workers.");
+            log(ns, "No hay RAM libre suficiente para ejecutar workers.");
             await ns.sleep(1000);
             continue;
         }
@@ -115,12 +116,12 @@ export async function main(ns) {
         const requestedThreads = Math.max(1, Math.ceil(action.threads));
         const threads = Math.min(requestedThreads, capacity);
 
-        ns.print(`Servidores descubiertos: ${servers.size}`);
-        ns.print(`Servidores con RAM utilizable: ${hosts.length}`);
-        ns.print(`Objetivo: ${target}`);
-        ns.print(`Acción: ${action.name}`);
-        ns.print(`Hilos: ${threads}/${requestedThreads} solicitados`);
-        ns.print(`Motivo: ${action.reason}`);
+        log(ns, `Servidores descubiertos: ${servers.size}`);
+        log(ns, `Servidores con RAM utilizable: ${hosts.length}`);
+        log(ns, `Objetivo: ${target}`);
+        log(ns, `Acción: ${action.name}`);
+        log(ns, `Hilos: ${threads}/${requestedThreads} solicitados`);
+        log(ns, `Motivo: ${action.reason}`);
 
         const pids = await deployWorkers(
             ns,
@@ -132,7 +133,7 @@ export async function main(ns) {
         );
 
         if (pids.length === 0) {
-            ns.print("No se pudo iniciar ningún worker; se reintentará.");
+            log(ns, "No se pudo iniciar ningún worker; se reintentará.");
             await ns.sleep(1000);
             continue;
         }
@@ -303,13 +304,13 @@ async function deployWorkers(ns, script, target, requestedThreads, hosts, script
         if (threads < 1) continue;
 
         if (host !== HOME && !await ns.scp(script, host, HOME)) {
-            ns.print(`SCP falló para ${host}.`);
+            log(ns, `SCP falló para ${host}.`);
             continue;
         }
 
         const pid = ns.exec(script, host, threads, target);
         if (pid === 0) {
-            ns.print(`EXEC falló para ${host} con ${threads} hilos.`);
+            log(ns, `EXEC falló para ${host} con ${threads} hilos.`);
             continue;
         }
 
@@ -318,6 +319,15 @@ async function deployWorkers(ns, script, target, requestedThreads, hosts, script
     }
 
     return pids;
+}
+
+/** @param {NS} ns @param {string} message */
+function log(ns, message) {
+    const now = new Date();
+    const time = [now.getHours(), now.getMinutes(), now.getSeconds()]
+        .map((value) => String(value).padStart(2, "0"))
+        .join(":");
+    ns.print(`[${time}] ${message}`);
 }
 
 /** @param {NS} ns */
