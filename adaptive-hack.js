@@ -1,6 +1,5 @@
 const HOME = "home";
 const FORMULAS = "Formulas.exe";
-const REPORT_MARKER = "adaptive-hack-result-v1";
 
 const WORKERS = {
     hack: {
@@ -9,29 +8,11 @@ const WORKERS = {
 export async function main(ns) {
     const target = String(ns.args[0]);
     const landingTime = Number(ns.args[1]) || 0;
-    const threads = Math.max(1, Number(ns.args[3]) || 1);
-    const expPerThread = Math.max(0, Number(ns.args[4]) || 0);
-    const reportPort = Number(ns.args[5]) || 20;
-    const session = String(ns.args[6] ?? "");
     const baseTime = ns.getHackTime(target);
     const additionalMsec = landingTime > 0
         ? Math.max(0, landingTime - Date.now() - baseTime)
         : 0;
-    const money = await ns.hack(target, { additionalMsec });
-    const success = money > 0;
-    await report(ns, reportPort, {
-        marker: "adaptive-hack-result-v1", session, action: "hack", target,
-        threads, success, money,
-        exp: expPerThread * threads * (success ? 1 : 0.25),
-    });
-}
-
-async function report(ns, port, event) {
-    const data = JSON.stringify(event);
-    for (let attempt = 0; attempt < 100; attempt++) {
-        if (ns.tryWritePort(port, data)) return;
-        await ns.sleep(20);
-    }
+    await ns.hack(target, { additionalMsec });
 }
 `,
     },
@@ -41,27 +22,11 @@ async function report(ns, port, event) {
 export async function main(ns) {
     const target = String(ns.args[0]);
     const landingTime = Number(ns.args[1]) || 0;
-    const threads = Math.max(1, Number(ns.args[3]) || 1);
-    const expPerThread = Math.max(0, Number(ns.args[4]) || 0);
-    const reportPort = Number(ns.args[5]) || 20;
-    const session = String(ns.args[6] ?? "");
     const baseTime = ns.getGrowTime(target);
     const additionalMsec = landingTime > 0
         ? Math.max(0, landingTime - Date.now() - baseTime)
         : 0;
-    const growth = await ns.grow(target, { additionalMsec });
-    await report(ns, reportPort, {
-        marker: "adaptive-hack-result-v1", session, action: "grow", target,
-        threads, growth, exp: expPerThread * threads,
-    });
-}
-
-async function report(ns, port, event) {
-    const data = JSON.stringify(event);
-    for (let attempt = 0; attempt < 100; attempt++) {
-        if (ns.tryWritePort(port, data)) return;
-        await ns.sleep(20);
-    }
+    await ns.grow(target, { additionalMsec });
 }
 `,
     },
@@ -71,27 +36,11 @@ async function report(ns, port, event) {
 export async function main(ns) {
     const target = String(ns.args[0]);
     const landingTime = Number(ns.args[1]) || 0;
-    const threads = Math.max(1, Number(ns.args[3]) || 1);
-    const expPerThread = Math.max(0, Number(ns.args[4]) || 0);
-    const reportPort = Number(ns.args[5]) || 20;
-    const session = String(ns.args[6] ?? "");
     const baseTime = ns.getWeakenTime(target);
     const additionalMsec = landingTime > 0
         ? Math.max(0, landingTime - Date.now() - baseTime)
         : 0;
-    const security = await ns.weaken(target, { additionalMsec });
-    await report(ns, reportPort, {
-        marker: "adaptive-hack-result-v1", session, action: "weaken", target,
-        threads, security, exp: expPerThread * threads,
-    });
-}
-
-async function report(ns, port, event) {
-    const data = JSON.stringify(event);
-    for (let attempt = 0; attempt < 100; attempt++) {
-        if (ns.tryWritePort(port, data)) return;
-        await ns.sleep(20);
-    }
+    await ns.weaken(target, { additionalMsec });
 }
 `,
     },
@@ -111,7 +60,6 @@ const FLAGS = [
     ["max-processes", 2000],
     ["poll", 100],
     ["rescan", 30000],
-    ["report-port", 20],
     ["fill-idle-ram", true],
     ["avoid-busy-targets", true],
     ["allow-conflicts", false],
@@ -120,8 +68,6 @@ const FLAGS = [
 
 const deployedHosts = new Set([HOME]);
 let learnedLaunchMsPerProcess = 2;
-let activeReportPort = 20;
-let reportSession = "";
 
 /** @param {NS} ns */
 export async function main(ns) {
@@ -135,9 +81,6 @@ export async function main(ns) {
         ns.tprint(`ERROR: ${ns.getScriptName()} debe ejecutarse desde home.`);
         return;
     }
-
-    activeReportPort = options["report-port"];
-    reportSession = `${ns.pid}-${Date.now()}`;
 
     const duplicate = ns.ps(HOME).find(
         (process) => process.filename === ns.getScriptName() && process.pid !== ns.pid,
@@ -155,6 +98,10 @@ export async function main(ns) {
             "ERROR: detén los otros coordinadores o usa --allow-conflicts true bajo tu responsabilidad.",
         );
         return;
+    }
+    const stoppedWorkers = stopOrphanedWorkers(ns, discoverServers(ns));
+    if (stoppedWorkers > 0) {
+        log(ns, `LIMPIEZA: detenidos ${stoppedWorkers} worker(s) de ejecuciones anteriores.`);
     }
 
     let previousTarget = "";
@@ -302,6 +249,19 @@ async function createWorkers(ns) {
             await ns.write(worker.path, worker.source, "w");
         }
     }
+}
+
+/** @param {NS} ns @param {Set<string>} servers */
+function stopOrphanedWorkers(ns, servers) {
+    const workerPaths = new Set(Object.values(WORKERS).map((worker) => worker.path));
+    let stopped = 0;
+    for (const host of servers) {
+        if (!ns.hasRootAccess(host)) continue;
+        for (const process of ns.ps(host)) {
+            if (workerPaths.has(process.filename) && ns.kill(process.pid)) stopped++;
+        }
+    }
+    return stopped;
 }
 
 /** @param {NS} ns */
@@ -1280,7 +1240,6 @@ async function launchReservation(ns, target, reservation, token, waveStart = nul
     const pids = [];
     let failures = 0;
     let timingMisses = 0;
-    const expPerThread = ns.getHackExp(target);
     for (const { operation, allocations } of reservation) {
         let part = 0;
         for (const allocation of allocations) {
@@ -1298,10 +1257,6 @@ async function launchReservation(ns, target, reservation, token, waveStart = nul
                 target,
                 landingTime,
                 `${token}-${operation.id}-${part++}`,
-                allocation.threads,
-                expPerThread,
-                activeReportPort,
-                reportSession,
             );
             if (pid === 0) {
                 failures++;
@@ -1380,11 +1335,9 @@ function findExternallyTargetedServers(ns, servers) {
 
 /** @param {NS} ns @param {number[]} pids @param {Record<string,any>} options */
 async function waitForPids(ns, pids, options) {
-    const results = createResultSummary();
     let nextRescan = Date.now() + options.rescan;
     while (pids.some((pid) => ns.isRunning(pid))) {
         await ns.sleep(options.poll);
-        drainWorkerReports(ns, results);
         if (Date.now() < nextRescan) continue;
         const rooted = rootServers(ns, discoverServers(ns));
         if (rooted > 0) {
@@ -1392,85 +1345,6 @@ async function waitForPids(ns, pids, options) {
         }
         nextRescan = Date.now() + options.rescan;
     }
-    drainWorkerReports(ns, results);
-    logResultSummary(ns, results);
-}
-
-function createResultSummary() {
-    return {
-        reports: 0,
-        hackAttempts: 0,
-        hackSuccesses: 0,
-        money: 0,
-        hackExp: 0,
-        growOperations: 0,
-        growExp: 0,
-        weakenOperations: 0,
-        security: 0,
-        weakenExp: 0,
-    };
-}
-
-/** @param {NS} ns @param {ReturnType<createResultSummary>} results */
-function drainWorkerReports(ns, results) {
-    while (true) {
-        const raw = ns.readPort(activeReportPort);
-        if (raw === "NULL PORT DATA") return;
-        if (typeof raw !== "string") continue;
-
-        let event;
-        try {
-            event = JSON.parse(raw);
-        } catch {
-            continue;
-        }
-        if (event?.marker !== REPORT_MARKER || event.session !== reportSession) continue;
-
-        results.reports++;
-        const exp = Math.max(0, Number(event.exp) || 0);
-        if (event.action === "hack") {
-            results.hackAttempts++;
-            results.hackSuccesses += event.success ? 1 : 0;
-            results.money += Math.max(0, Number(event.money) || 0);
-            results.hackExp += exp;
-        } else if (event.action === "grow") {
-            results.growOperations++;
-            results.growExp += exp;
-        } else if (event.action === "weaken") {
-            results.weakenOperations++;
-            results.security += Math.max(0, Number(event.security) || 0);
-            results.weakenExp += exp;
-        }
-    }
-}
-
-/** @param {NS} ns @param {ReturnType<createResultSummary>} results */
-function logResultSummary(ns, results) {
-    if (results.reports === 0) return;
-    const parts = [];
-    if (results.hackAttempts > 0) {
-        const failures = results.hackAttempts - results.hackSuccesses;
-        parts.push(
-            `HACK ${results.hackSuccesses}/${results.hackAttempts} exitosos` +
-            (failures > 0 ? ` (${failures} fallidos)` : "") +
-            `, $${ns.format.number(results.money, 2)}, EXP +${ns.format.number(results.hackExp, 2)}`,
-        );
-    }
-    if (results.growOperations > 0) {
-        parts.push(
-            `GROW ${results.growOperations} operaciones, ` +
-            `EXP +${ns.format.number(results.growExp, 2)}`,
-        );
-    }
-    if (results.weakenOperations > 0) {
-        parts.push(
-            `WEAKEN ${results.weakenOperations} operaciones, ` +
-            `seguridad -${results.security.toFixed(4)}, ` +
-            `EXP +${ns.format.number(results.weakenExp, 2)}`,
-        );
-    }
-    const totalExp = results.hackExp + results.growExp + results.weakenExp;
-    log(ns, `RESULTADO: ${parts.join(" | ")} | EXP total +${ns.format.number(totalExp, 2)}.`);
 }
 
 /** @param {NS} ns */
@@ -1526,7 +1400,6 @@ function validateOptions(ns, options) {
         "max-processes",
         "poll",
         "rescan",
-        "report-port",
     ];
     if (finiteOptions.some((name) => !Number.isFinite(Number(options[name])))) {
         ns.tprint("ERROR: las opciones numéricas deben contener números finitos.");
@@ -1540,11 +1413,6 @@ function validateOptions(ns, options) {
     options["max-processes"] = Math.max(4, Math.floor(Number(options["max-processes"])));
     options.poll = Math.max(50, Math.floor(Number(options.poll)));
     options.rescan = Math.max(1000, Math.floor(Number(options.rescan)));
-    options["report-port"] = Math.floor(Number(options["report-port"]));
-    if (options["report-port"] < 1 || options["report-port"] > 20) {
-        ns.tprint("ERROR: --report-port debe estar entre 1 y 20.");
-        return false;
-    }
     return true;
 }
 
@@ -1571,7 +1439,6 @@ function printHelp(ns) {
     ns.tprint("  --launch-buffer 1000      Tiempo para desplegar la oleada antes de aterrizar.");
     ns.tprint("  --max-batches 200         Protección contra exceso de procesos.");
     ns.tprint("  --max-processes 2000      Límite real de procesos por oleada.");
-    ns.tprint("  --report-port 20          Puerto reservado para resumir resultados.");
     ns.tprint("  --fill-idle-ram true      Usa huecos de RAM con objetivos secundarios.");
     ns.tprint("  --avoid-busy-targets true Evita víctimas usadas por otros scripts.");
     ns.tprint("  --allow-conflicts false   Permite otros coordinadores (arriesgado).");
