@@ -111,7 +111,7 @@ export function pathJoin(...args) {
 
 /** Gets the path for the given local file, taking into account optional subfolder relocation via git-pull.js **/
 export function getFilePath(file) {
-    const subfolder = '';  // git-pull.js optionally modifies this when downloading
+    const subfolder = '/alainbryden';
     return pathJoin(subfolder, file);
 }
 
@@ -364,7 +364,7 @@ export async function runCommand_Custom(ns, fnRun, command, fileName, args = [],
     let importFunctions = getExports(ns).filter(e => command.includes(`${e}`)) // Check if the script includes the name of any functions
         // To avoid false positives, narrow these to "whole word" matches (no alpha characters on either side)
         .filter(e => new RegExp(`(^|[^\\w])${e}([^\\w]|\$)`).test(command));
-    let script = (importFunctions.length > 0 ? `import { ${importFunctions.join(", ")} } from 'helpers.js'\n` : '') +
+    let script = (importFunctions.length > 0 ? `import { ${importFunctions.join(", ")} } from '${getFilePath('helpers.js')}'\n` : '') +
         `export async function main(ns) { ${command} }`;
     fileName = fileName || getDefaultCommandFileName(command, '.js');
     if (verbose)
@@ -954,8 +954,5 @@ function isV3(ns) {
 }
 
 export function formatTime(ns, milliseconds, milliPrecision) {
-    if (isV3(ns)) {
-        return ns.ui.time(milliseconds, milliPrecision);
-    }
-    return ns.tFormat(milliseconds, milliPrecision);
+    return ns.format.time(milliseconds, milliPrecision);
 }

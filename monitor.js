@@ -10,22 +10,33 @@ export async function main(ns) {
         ns.tprint(`> run ${ns.getScriptName()} n00dles`)
         return;
     }
-    ns.tail();
+    const server = String(flags._[0]);
+    if (!ns.serverExists(server)) {
+        ns.tprint(`ERROR: El servidor "${server}" no existe.`);
+        return;
+    }
+
+    const serverInfo = ns.getServer(server);
+    if ((serverInfo.moneyMax ?? 0) <= 0) {
+        ns.tprint(`ERROR: "${server}" no es un servidor hackeable con dinero.`);
+        return;
+    }
+
+    ns.ui.openTail();
     ns.disableLog('ALL');
     while (true) {
-        const server = flags._[0];
-        let money = ns.getServerMoneyAvailable(server);
-        if (money === 0) money = 1;
+        const money = ns.getServerMoneyAvailable(server);
+        const safeMoney = Math.max(money, 1);
         const maxMoney = ns.getServerMaxMoney(server);
         const minSec = ns.getServerMinSecurityLevel(server);
         const sec = ns.getServerSecurityLevel(server);
-        ns.clearLog(server);
+        ns.clearLog();
         ns.print(`${server}:`);
-        ns.print(` $_______: ${ns.nFormat(money, "$0.000a")} / ${ns.nFormat(maxMoney, "$0.000a")} (${(money / maxMoney * 100).toFixed(2)}%)`);
+        ns.print(` $_______: $${ns.format.number(money, 3)} / $${ns.format.number(maxMoney, 3)} (${ns.format.percent(money / maxMoney, 2)})`);
         ns.print(` security: +${(sec - minSec).toFixed(2)}`);
-        ns.print(` hack____: ${ns.tFormat(ns.getHackTime(server))} (t=${Math.ceil(ns.hackAnalyzeThreads(server, money))})`);
-        ns.print(` grow____: ${ns.tFormat(ns.getGrowTime(server))} (t=${Math.ceil(ns.growthAnalyze(server, maxMoney / money))})`);
-        ns.print(` weaken__: ${ns.tFormat(ns.getWeakenTime(server))} (t=${Math.ceil((sec - minSec) * 20)})`);
+        ns.print(` hack____: ${ns.format.time(ns.getHackTime(server))} (t=${Math.ceil(ns.hackAnalyzeThreads(server, safeMoney))})`);
+        ns.print(` grow____: ${ns.format.time(ns.getGrowTime(server))} (t=${Math.ceil(ns.growthAnalyze(server, maxMoney / safeMoney))})`);
+        ns.print(` weaken__: ${ns.format.time(ns.getWeakenTime(server))} (t=${Math.ceil((sec - minSec) * 20)})`);
         await ns.sleep(flags.refreshrate);
     }
 }

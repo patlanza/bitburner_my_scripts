@@ -37,6 +37,14 @@ export async function main(ns) {
         return;
     }
 
+    const requestedTarget = ns.getServer(target);
+    if ((requestedTarget.moneyMax ?? 0) <= 0) {
+        ns.tprint(
+            `ERROR: "${target}" no es un servidor hackeable con dinero.`
+        );
+        return;
+    }
+
     const hackScriptRam = ns.getScriptRam(hackScript, HOME);
 
     if (hackScriptRam <= 0) {

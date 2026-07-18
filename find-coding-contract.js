@@ -27,7 +27,7 @@ export async function main(ns) {
     }
 
     let servers = list_servers(ns);
-    const boughtServers = ns.getPurchasedServers(ns);
+    const boughtServers = ns.cloud.getServerNames();
     servers = servers.filter(s => !boughtServers.includes(s));
     const hostname = servers.find(s => ns.ls(s).find(f => f.endsWith(".cct")))
     if(!hostname) {

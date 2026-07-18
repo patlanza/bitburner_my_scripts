@@ -20,7 +20,10 @@ export async function main(ns) {
     }
 
     // Get root access to target server
-    ns.nuke(target);
+    if (!ns.hasRootAccess(target) && !ns.nuke(target)) {
+        ns.tprint(`ERROR: No se pudo obtener acceso root en ${target}.`);
+        return;
+    }
 
     // Infinite loop that continously hacks/grows/weakens the target server
     while (true) {

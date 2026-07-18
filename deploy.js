@@ -22,8 +22,20 @@ export async function main(ns) {
 		return;
 	}
 
-	const threads = Math.floor((ns.getServerMaxRam(host) - ns.getServerUsedRam(host)) / ns.getScriptRam(script));
+	const source = ns.getHostname();
+	const scriptRam = ns.getScriptRam(script, source);
+	const threads = Math.floor((ns.getServerMaxRam(host) - ns.getServerUsedRam(host)) / scriptRam);
+	if (threads < 1) {
+		ns.tprint(`Server '${host}' does not have enough free RAM for '${script}'.`);
+		return;
+	}
+
 	ns.tprint(`Launching script '${script}' on server '${host}' with ${threads} threads and the following arguments: ${script_args}`);
-	await ns.scp(script, ns.getHostname(), host);
-	ns.exec(script, host, threads, ...script_args);
+	if (!await ns.scp(script, host, source)) {
+		ns.tprint(`Could not copy '${script}' from '${source}' to '${host}'.`);
+		return;
+	}
+
+	const pid = ns.exec(script, host, threads, ...script_args);
+	if (pid === 0) ns.tprint(`Could not launch '${script}' on '${host}'.`);
 }
