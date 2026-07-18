@@ -59,6 +59,7 @@ const FLAGS = [
     ["max-batches", 200],
     ["max-processes", 2000],
     ["poll", 100],
+    ["refill", 1000],
     ["rescan", 30000],
     ["fill-idle-ram", true],
     ["avoid-busy-targets", true],
@@ -140,9 +141,11 @@ export async function main(ns) {
         }
 
         const workerRam = getWorkerRam(ns);
-        const busyTargets = options["avoid-busy-targets"]
-            ? findExternallyTargetedServers(ns, servers)
-            : new Set();
+        const busyTargets = findBusyTargets(
+            ns,
+            servers,
+            options["avoid-busy-targets"],
+        );
         const selection = chooseTarget(
             ns,
             servers,
@@ -180,11 +183,11 @@ export async function main(ns) {
             `seguridad +${securityGap.toFixed(4)}.`,
         );
 
-        let pids = [];
+        let primaryPids = [];
         if (securityGap > options["security-tolerance"]) {
-            pids = await runSecurityPrep(ns, targetServer, hosts, workerRam);
+            primaryPids = await runSecurityPrep(ns, targetServer, hosts, workerRam);
         } else if (moneyRatio < options["money-threshold"]) {
-            pids = await runMoneyPrep(
+            primaryPids = await runMoneyPrep(
                 ns,
                 targetServer,
                 hosts,
@@ -204,11 +207,11 @@ export async function main(ns) {
             const batchingAllowed = options.strategy !== "controller";
 
             if (batchingAllowed && plan?.recommendedBatches > 0) {
-                pids = await runBatchWave(ns, targetServer, hosts, plan, options);
+                primaryPids = await runBatchWave(ns, targetServer, hosts, plan, options);
             }
 
-            if (pids.length === 0) {
-                pids = await runControllerHack(
+            if (primaryPids.length === 0) {
+                primaryPids = await runControllerHack(
                     ns,
                     targetServer,
                     hosts,
@@ -218,8 +221,13 @@ export async function main(ns) {
             }
         }
 
-        if (options["fill-idle-ram"] && pids.length < options["max-processes"]) {
-            const fillerPids = await runIdleFill(
+        let fillerPids = [];
+        const processBudget = Math.max(
+            0,
+            options["max-processes"] - countActiveWorkers(ns, servers),
+        );
+        if (options["fill-idle-ram"] && processBudget > 0) {
+            fillerPids = await runIdleFill(
                 ns,
                 servers,
                 hosts,
@@ -227,18 +235,21 @@ export async function main(ns) {
                 target,
                 busyTargets,
                 options,
-                options["max-processes"] - pids.length,
+                processBudget,
             );
-            pids.push(...fillerPids);
         }
 
-        if (pids.length === 0) {
+        if (primaryPids.length === 0) {
+            if (fillerPids.length > 0) {
+                await ns.sleep(options.refill);
+                continue;
+            }
             log(ns, "No se pudo iniciar trabajo; se reintentará.");
             await ns.sleep(1000);
             continue;
         }
 
-        await waitForPids(ns, pids, options);
+        await maintainUtilization(ns, primaryPids, target, workerRam, options);
     }
 }
 
@@ -314,11 +325,24 @@ function discoverServers(ns) {
  */
 function getExecutionHosts(ns, servers, homeRamFraction) {
     const hosts = [];
+    const workerPaths = new Set(Object.values(WORKERS).map((worker) => worker.path));
     for (const host of servers) {
         const server = ns.getServer(host);
         if (!server.hasAdminRights || server.maxRam <= 0) continue;
         const availableRam = Math.max(0, server.maxRam - server.ramUsed);
-        const freeRam = host === HOME ? availableRam * homeRamFraction : availableRam;
+        let freeRam = availableRam;
+        if (host === HOME) {
+            const managedRam = ns.ps(HOME)
+                .filter((process) => workerPaths.has(process.filename))
+                .reduce(
+                    (total, process) =>
+                        total + ns.getScriptRam(process.filename, HOME) * process.threads,
+                    0,
+                );
+            const unmanagedRam = Math.max(0, server.ramUsed - managedRam);
+            const managedBudget = Math.max(0, server.maxRam - unmanagedRam) * homeRamFraction;
+            freeRam = Math.max(0, managedBudget - managedRam);
+        }
         if (freeRam > 0) {
             const cpuCores = Math.max(1, server.cpuCores ?? 1);
             hosts.push({
@@ -1313,8 +1337,14 @@ function getMaxSingleProcessThreads(hosts, scriptRam) {
     );
 }
 
-/** @param {NS} ns @param {Set<string>} servers */
-function findExternallyTargetedServers(ns, servers) {
+/**
+ * Las victimas de relleno propias siempre se protegen mientras sigan activas.
+ * Los procesos ajenos solo se incluyen cuando avoid-busy-targets esta activo.
+ * @param {NS} ns
+ * @param {Set<string>} servers
+ * @param {boolean} includeExternal
+ */
+function findBusyTargets(ns, servers, includeExternal = true) {
     const targets = new Set();
     const knownServers = new Set(servers);
     const ownWorkers = new Set(Object.values(WORKERS).map((worker) => worker.path));
@@ -1322,7 +1352,14 @@ function findExternallyTargetedServers(ns, servers) {
     for (const host of servers) {
         if (!ns.hasRootAccess(host)) continue;
         for (const process of ns.ps(host)) {
-            if (process.pid === ns.pid || ownWorkers.has(process.filename)) continue;
+            if (process.pid === ns.pid) continue;
+            if (ownWorkers.has(process.filename)) {
+                const token = String(process.args[2] ?? "");
+                const target = String(process.args[0] ?? "");
+                if (token.startsWith("fill-") && knownServers.has(target)) targets.add(target);
+                continue;
+            }
+            if (!includeExternal) continue;
             if (!/(hack|grow|weaken|batch)/i.test(process.filename)) continue;
             for (const argument of process.args) {
                 const possibleTarget = String(argument);
@@ -1333,18 +1370,73 @@ function findExternallyTargetedServers(ns, servers) {
     return targets;
 }
 
-/** @param {NS} ns @param {number[]} pids @param {Record<string,any>} options */
-async function waitForPids(ns, pids, options) {
+/**
+ * Espera solo al trabajo principal. Mientras sigue activo, vuelve a llenar
+ * periodicamente cualquier RAM liberada por otros workers.
+ * @param {NS} ns
+ * @param {number[]} primaryPids
+ * @param {string} primaryTarget
+ * @param {Record<string,number>} workerRam
+ * @param {Record<string,any>} options
+ */
+async function maintainUtilization(ns, primaryPids, primaryTarget, workerRam, options) {
     let nextRescan = Date.now() + options.rescan;
-    while (pids.some((pid) => ns.isRunning(pid))) {
+    let nextRefill = Date.now() + options.refill;
+    while (primaryPids.some((pid) => ns.isRunning(pid))) {
         await ns.sleep(options.poll);
-        if (Date.now() < nextRescan) continue;
-        const rooted = rootServers(ns, discoverServers(ns));
-        if (rooted > 0) {
-            log(ns, `ROOT durante ejecución: ${rooted} nuevo(s); se usarán en el próximo ciclo.`);
+        const now = Date.now();
+
+        if (options["fill-idle-ram"] && now >= nextRefill) {
+            await refillIdleHosts(ns, primaryTarget, workerRam, options);
+            nextRefill = Date.now() + options.refill;
         }
-        nextRescan = Date.now() + options.rescan;
+
+        if (now >= nextRescan) {
+            const rooted = rootServers(ns, discoverServers(ns));
+            if (rooted > 0) {
+                log(ns, `ROOT durante ejecución: ${rooted} nuevo(s); se usarán inmediatamente.`);
+            }
+            nextRescan = Date.now() + options.rescan;
+        }
     }
+}
+
+/** @param {NS} ns */
+async function refillIdleHosts(ns, primaryTarget, workerRam, options) {
+    const servers = discoverServers(ns);
+    let hosts = getExecutionHosts(ns, servers, options["home-ram-fraction"]);
+    hosts = await prepareExecutionHosts(ns, hosts);
+    if (!hasWorkerCapacity(ns, hosts)) return [];
+
+    const activeWorkers = countActiveWorkers(ns, servers);
+    const processBudget = Math.max(0, options["max-processes"] - activeWorkers);
+    if (processBudget < 1) return [];
+    const busyTargets = findBusyTargets(
+        ns,
+        servers,
+        options["avoid-busy-targets"],
+    );
+    return runIdleFill(
+        ns,
+        servers,
+        hosts,
+        workerRam,
+        primaryTarget,
+        busyTargets,
+        options,
+        processBudget,
+    );
+}
+
+/** @param {NS} ns @param {Set<string>} servers */
+function countActiveWorkers(ns, servers) {
+    const workerPaths = new Set(Object.values(WORKERS).map((worker) => worker.path));
+    let active = 0;
+    for (const host of servers) {
+        if (!ns.hasRootAccess(host)) continue;
+        active += ns.ps(host).filter((process) => workerPaths.has(process.filename)).length;
+    }
+    return active;
 }
 
 /** @param {NS} ns */
@@ -1399,6 +1491,7 @@ function validateOptions(ns, options) {
         "max-batches",
         "max-processes",
         "poll",
+        "refill",
         "rescan",
     ];
     if (finiteOptions.some((name) => !Number.isFinite(Number(options[name])))) {
@@ -1412,6 +1505,7 @@ function validateOptions(ns, options) {
     options["max-batches"] = Math.max(1, Math.floor(Number(options["max-batches"])));
     options["max-processes"] = Math.max(4, Math.floor(Number(options["max-processes"])));
     options.poll = Math.max(50, Math.floor(Number(options.poll)));
+    options.refill = Math.max(250, Math.floor(Number(options.refill)));
     options.rescan = Math.max(1000, Math.floor(Number(options.rescan)));
     return true;
 }
@@ -1440,6 +1534,7 @@ function printHelp(ns) {
     ns.tprint("  --max-batches 200         Protección contra exceso de procesos.");
     ns.tprint("  --max-processes 2000      Límite real de procesos por oleada.");
     ns.tprint("  --fill-idle-ram true      Usa huecos de RAM con objetivos secundarios.");
+    ns.tprint("  --refill 1000             Revisa RAM ociosa cada milisegundos.");
     ns.tprint("  --avoid-busy-targets true Evita víctimas usadas por otros scripts.");
     ns.tprint("  --allow-conflicts false   Permite otros coordinadores (arriesgado).");
     ns.tprint("  --rescan 30000            Reintento de root mientras trabaja, en ms.");
