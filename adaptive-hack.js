@@ -1,5 +1,6 @@
 const HOME = "home";
 const FORMULAS = "Formulas.exe";
+const REPORT_MARKER = "adaptive-hack-result-v1";
 
 const WORKERS = {
     hack: {
@@ -8,11 +9,29 @@ const WORKERS = {
 export async function main(ns) {
     const target = String(ns.args[0]);
     const landingTime = Number(ns.args[1]) || 0;
+    const threads = Math.max(1, Number(ns.args[3]) || 1);
+    const expPerThread = Math.max(0, Number(ns.args[4]) || 0);
+    const reportPort = Number(ns.args[5]) || 20;
+    const session = String(ns.args[6] ?? "");
     const baseTime = ns.getHackTime(target);
     const additionalMsec = landingTime > 0
         ? Math.max(0, landingTime - Date.now() - baseTime)
         : 0;
-    await ns.hack(target, { additionalMsec });
+    const money = await ns.hack(target, { additionalMsec });
+    const success = money > 0;
+    await report(ns, reportPort, {
+        marker: "adaptive-hack-result-v1", session, action: "hack", target,
+        threads, success, money,
+        exp: expPerThread * threads * (success ? 1 : 0.25),
+    });
+}
+
+async function report(ns, port, event) {
+    const data = JSON.stringify(event);
+    for (let attempt = 0; attempt < 100; attempt++) {
+        if (ns.tryWritePort(port, data)) return;
+        await ns.sleep(20);
+    }
 }
 `,
     },
@@ -22,11 +41,27 @@ export async function main(ns) {
 export async function main(ns) {
     const target = String(ns.args[0]);
     const landingTime = Number(ns.args[1]) || 0;
+    const threads = Math.max(1, Number(ns.args[3]) || 1);
+    const expPerThread = Math.max(0, Number(ns.args[4]) || 0);
+    const reportPort = Number(ns.args[5]) || 20;
+    const session = String(ns.args[6] ?? "");
     const baseTime = ns.getGrowTime(target);
     const additionalMsec = landingTime > 0
         ? Math.max(0, landingTime - Date.now() - baseTime)
         : 0;
-    await ns.grow(target, { additionalMsec });
+    const growth = await ns.grow(target, { additionalMsec });
+    await report(ns, reportPort, {
+        marker: "adaptive-hack-result-v1", session, action: "grow", target,
+        threads, growth, exp: expPerThread * threads,
+    });
+}
+
+async function report(ns, port, event) {
+    const data = JSON.stringify(event);
+    for (let attempt = 0; attempt < 100; attempt++) {
+        if (ns.tryWritePort(port, data)) return;
+        await ns.sleep(20);
+    }
 }
 `,
     },
@@ -36,11 +71,27 @@ export async function main(ns) {
 export async function main(ns) {
     const target = String(ns.args[0]);
     const landingTime = Number(ns.args[1]) || 0;
+    const threads = Math.max(1, Number(ns.args[3]) || 1);
+    const expPerThread = Math.max(0, Number(ns.args[4]) || 0);
+    const reportPort = Number(ns.args[5]) || 20;
+    const session = String(ns.args[6] ?? "");
     const baseTime = ns.getWeakenTime(target);
     const additionalMsec = landingTime > 0
         ? Math.max(0, landingTime - Date.now() - baseTime)
         : 0;
-    await ns.weaken(target, { additionalMsec });
+    const security = await ns.weaken(target, { additionalMsec });
+    await report(ns, reportPort, {
+        marker: "adaptive-hack-result-v1", session, action: "weaken", target,
+        threads, security, exp: expPerThread * threads,
+    });
+}
+
+async function report(ns, port, event) {
+    const data = JSON.stringify(event);
+    for (let attempt = 0; attempt < 100; attempt++) {
+        if (ns.tryWritePort(port, data)) return;
+        await ns.sleep(20);
+    }
 }
 `,
     },
@@ -49,7 +100,7 @@ export async function main(ns) {
 const FLAGS = [
     ["target", ""],
     ["strategy", "auto"],
-    ["home-ram-fraction", 0.5],
+    ["home-ram-fraction", 0.75],
     ["hack-fraction", 0],
     ["max-hack-fraction", 0.8],
     ["money-threshold", 0.999999],
@@ -60,6 +111,8 @@ const FLAGS = [
     ["max-processes", 2000],
     ["poll", 100],
     ["rescan", 30000],
+    ["report-port", 20],
+    ["fill-idle-ram", true],
     ["avoid-busy-targets", true],
     ["allow-conflicts", false],
     ["help", false],
@@ -67,6 +120,8 @@ const FLAGS = [
 
 const deployedHosts = new Set([HOME]);
 let learnedLaunchMsPerProcess = 2;
+let activeReportPort = 20;
+let reportSession = "";
 
 /** @param {NS} ns */
 export async function main(ns) {
@@ -80,6 +135,9 @@ export async function main(ns) {
         ns.tprint(`ERROR: ${ns.getScriptName()} debe ejecutarse desde home.`);
         return;
     }
+
+    activeReportPort = options["report-port"];
+    reportSession = `${ns.pid}-${Date.now()}`;
 
     const duplicate = ns.ps(HOME).find(
         (process) => process.filename === ns.getScriptName() && process.pid !== ns.pid,
@@ -211,6 +269,20 @@ export async function main(ns) {
                     options,
                 );
             }
+        }
+
+        if (options["fill-idle-ram"] && pids.length < options["max-processes"]) {
+            const fillerPids = await runIdleFill(
+                ns,
+                servers,
+                hosts,
+                workerRam,
+                target,
+                busyTargets,
+                options,
+                options["max-processes"] - pids.length,
+            );
+            pids.push(...fillerPids);
         }
 
         if (pids.length === 0) {
@@ -687,7 +759,12 @@ async function runSecurityPrep(ns, server, hosts, workerRam) {
         (total, allocation) => total + allocation.threads,
         0,
     );
-    log(ns, `ETAPA PREP: weaken ${server.hostname}, ${actualThreads}/${requested} hilo(s).`);
+    const prepHosts = new Set(reservation[0].allocations.map((allocation) => allocation.host));
+    log(
+        ns,
+        `ETAPA PREP: weaken ${server.hostname}, ${actualThreads}/${requested} hilo(s), ` +
+        `${prepHosts.size} host(s).`,
+    );
     const launch = await launchReservation(
         ns,
         server.hostname,
@@ -728,7 +805,6 @@ async function runMoneyPrep(ns, server, hosts, workerRam, hasFormulas) {
                 type: "grow",
                 threads: growThreads,
                 delay: 0,
-                singleProcess: true,
             },
             {
                 id: "prep-grow-weaken",
@@ -745,17 +821,13 @@ async function runMoneyPrep(ns, server, hosts, workerRam, hasFormulas) {
     if (growThreads > 0) {
         operations = operationFactory(growThreads);
     } else {
-        const growOnly = Math.min(
-            requestedGrow,
-            getMaxSingleProcessThreads(hosts, workerRam.grow),
-        );
+        const growOnly = Math.min(requestedGrow, getThreadCapacity(hosts, workerRam.grow));
         if (growOnly < 1) return [];
         operations = [{
             id: "prep-grow",
             type: "grow",
             threads: growOnly,
             delay: 0,
-            singleProcess: true,
         }];
     }
 
@@ -768,10 +840,14 @@ async function runMoneyPrep(ns, server, hosts, workerRam, hasFormulas) {
         .filter((item) => item.operation.type === "weaken")
         .flatMap((item) => item.allocations)
         .reduce((total, allocation) => total + allocation.threads, 0);
+    const prepHosts = new Set(
+        reservation.flatMap((item) => item.allocations.map((allocation) => allocation.host)),
+    );
     log(
         ns,
         `ETAPA PREP: grow ${server.hostname}, ${actualGrow}/${requestedGrow} hilo(s)` +
-        (actualWeaken > 0 ? ` + weaken ${actualWeaken}.` : "."),
+        (actualWeaken > 0 ? ` + weaken ${actualWeaken}` : "") +
+        `, ${prepHosts.size} host(s).`,
     );
     const launch = await launchReservation(
         ns,
@@ -792,6 +868,7 @@ async function runMoneyPrep(ns, server, hosts, workerRam, hasFormulas) {
  */
 async function runBatchWave(ns, server, hosts, plan, options) {
     const pids = [];
+    const usedHosts = new Set();
     let launchedBatches = 0;
     let hadTimingMiss = false;
     let launchedProcesses = 0;
@@ -838,6 +915,9 @@ async function runBatchWave(ns, server, hosts, plan, options) {
             `wave-${waveId}-batch-${batch}`,
             waveStart,
         );
+        for (const item of reservation) {
+            for (const allocation of item.allocations) usedHosts.add(allocation.host);
+        }
         pids.push(...launch.pids);
         launchedProcesses += launch.pids.length;
         if (!launch.complete) {
@@ -860,7 +940,7 @@ async function runBatchWave(ns, server, hosts, plan, options) {
             `${ns.format.percent(plan.actualFraction, 2)} por hack, ` +
             `probabilidad ${ns.format.percent(plan.chance, 2)}, ` +
             `${ns.format.ram(plan.batchRam)} por batch, ` +
-            `${pids.length} proceso(s).`,
+            `${pids.length} proceso(s) en ${usedHosts.size} host(s).`,
         );
     }
     const launchDuration = Date.now() - waveStart;
@@ -917,6 +997,160 @@ async function runControllerHack(ns, server, hosts, workerRam, options) {
         `controller-${Date.now()}`,
     );
     return launch.pids;
+}
+
+/**
+ * Usa los huecos que deja el plan principal con trabajo no sincronizado sobre
+ * objetivos secundarios. Nunca toca la victima principal, por lo que no puede
+ * romper sus batches HWGW. Es deliberadamente conservador con cada hack y
+ * vuelve a medir todos los estados en el ciclo siguiente.
+ * @param {NS} ns
+ * @param {Set<string>} servers
+ * @param {{host:string,freeRam:number,cpuCores:number,weakenPerThread:number}[]} hosts
+ * @param {Record<string,number>} workerRam
+ * @param {string} primaryTarget
+ * @param {Set<string>} busyTargets
+ * @param {Record<string,any>} options
+ * @param {number} processBudget
+ */
+async function runIdleFill(
+    ns,
+    servers,
+    hosts,
+    workerRam,
+    primaryTarget,
+    busyTargets,
+    options,
+    processBudget,
+) {
+    if (processBudget < 1) return [];
+    const hackingLevel = ns.getHackingLevel();
+    // Concentrar el relleno en los mejores secundarios evita que un objetivo
+    // muy lento retrase toda la siguiente reevaluacion del coordinador.
+    const targets = [...servers]
+        .filter((host) => host !== primaryTarget && !busyTargets.has(host))
+        .map((host) => ns.getServer(host))
+        .filter((server) =>
+            server.hasAdminRights &&
+            server.moneyMax > 0 &&
+            server.requiredHackingSkill <= hackingLevel
+        )
+        .map((server) => ({
+            ...server,
+            score: server.moneyMax * Math.max(0.01, ns.hackAnalyzeChance(server.hostname)) /
+                Math.max(1, ns.getWeakenTime(server.hostname)),
+        }))
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 8);
+    if (targets.length === 0) return [];
+
+    const reservationsByTarget = new Map();
+    const usedHosts = new Set();
+    const usedTargets = new Set();
+    let usedRam = 0;
+    let plannedProcesses = 0;
+    let cursor = 0;
+    let jobId = 0;
+
+    for (const hostInfo of hosts) {
+        let misses = 0;
+        while (plannedProcesses < processBudget && misses < targets.length) {
+            const target = targets[cursor++ % targets.length];
+            const job = planFillerJob(ns, target, hostInfo, workerRam, options);
+            if (!job) {
+                misses++;
+                continue;
+            }
+
+            misses = 0;
+            const ram = job.threads * workerRam[job.type];
+            hostInfo.freeRam = Math.max(0, hostInfo.freeRam - ram);
+            usedRam += ram;
+            usedHosts.add(hostInfo.host);
+            usedTargets.add(target.hostname);
+            plannedProcesses++;
+
+            const reservation = reservationsByTarget.get(target.hostname) ?? [];
+            reservation.push({
+                operation: {
+                    id: `fill-${jobId++}`,
+                    type: job.type,
+                    threads: job.threads,
+                    delay: 0,
+                },
+                allocations: [{ host: hostInfo.host, threads: job.threads }],
+            });
+            reservationsByTarget.set(target.hostname, reservation);
+        }
+    }
+
+    const pids = [];
+    const fillId = Date.now();
+    for (const [target, reservation] of reservationsByTarget) {
+        const launch = await launchReservation(
+            ns,
+            target,
+            reservation,
+            `fill-${fillId}-${target}`,
+        );
+        pids.push(...launch.pids);
+    }
+    if (pids.length > 0) {
+        log(
+            ns,
+            `ETAPA RELLENO: ${pids.length} proceso(s) en ${usedHosts.size} host(s), ` +
+            `${usedTargets.size} objetivo(s), ${ns.format.ram(usedRam)} aprovechados.`,
+        );
+    }
+    return pids;
+}
+
+/**
+ * Decide una sola accion de relleno y actualiza el estado proyectado para que
+ * las siguientes asignaciones no sobre-hackeen ni sobre-preparen el objetivo.
+ * @param {NS} ns
+ * @param {Server & {score:number}} target
+ * @param {{freeRam:number,cpuCores:number,weakenPerThread:number}} hostInfo
+ * @param {Record<string,number>} workerRam
+ * @param {Record<string,any>} options
+ */
+function planFillerJob(ns, target, hostInfo, workerRam, options) {
+    const securityGap = Math.max(0, target.hackDifficulty - target.minDifficulty);
+    let capacity = Math.floor(hostInfo.freeRam / workerRam.weaken);
+    if (securityGap > options["security-tolerance"] && capacity > 0) {
+        const effect = hostInfo.weakenPerThread ?? ns.weakenAnalyze(1, hostInfo.cpuCores);
+        const threads = Math.min(capacity, Math.max(1, Math.ceil(securityGap / effect)));
+        target.hackDifficulty = Math.max(target.minDifficulty, target.hackDifficulty - threads * effect);
+        return { type: "weaken", threads };
+    }
+
+    const moneyRatio = target.moneyAvailable / target.moneyMax;
+    capacity = Math.floor(hostInfo.freeRam / workerRam.grow);
+    if (moneyRatio < options["money-threshold"] && capacity > 0) {
+        const multiplier = target.moneyMax / Math.max(1, target.moneyAvailable);
+        let required = Math.ceil(ns.growthAnalyze(target.hostname, multiplier, hostInfo.cpuCores));
+        if (!Number.isFinite(required) || required < 1) required = capacity;
+        const threads = Math.min(capacity, required);
+        const progress = Math.min(1, threads / required);
+        target.moneyAvailable = Math.min(
+            target.moneyMax,
+            Math.max(1, target.moneyAvailable) * Math.pow(multiplier, progress),
+        );
+        target.hackDifficulty += ns.growthAnalyzeSecurity(threads);
+        return { type: "grow", threads };
+    }
+
+    capacity = Math.floor(hostInfo.freeRam / workerRam.hack);
+    if (capacity < 1) return null;
+    const hackPercent = ns.hackAnalyze(target.hostname);
+    if (!Number.isFinite(hackPercent) || hackPercent <= 0) return null;
+    const desiredFraction = Math.min(0.1, options["max-hack-fraction"]);
+    const requested = Math.max(1, Math.floor(desiredFraction / hackPercent));
+    const threads = Math.min(capacity, requested);
+    const actualFraction = Math.min(0.99, hackPercent * threads);
+    target.moneyAvailable *= 1 - actualFraction;
+    target.hackDifficulty += ns.hackAnalyzeSecurity(threads, target.hostname);
+    return { type: "hack", threads };
 }
 
 /**
@@ -1046,6 +1280,7 @@ async function launchReservation(ns, target, reservation, token, waveStart = nul
     const pids = [];
     let failures = 0;
     let timingMisses = 0;
+    const expPerThread = ns.getHackExp(target);
     for (const { operation, allocations } of reservation) {
         let part = 0;
         for (const allocation of allocations) {
@@ -1063,6 +1298,10 @@ async function launchReservation(ns, target, reservation, token, waveStart = nul
                 target,
                 landingTime,
                 `${token}-${operation.id}-${part++}`,
+                allocation.threads,
+                expPerThread,
+                activeReportPort,
+                reportSession,
             );
             if (pid === 0) {
                 failures++;
@@ -1141,9 +1380,11 @@ function findExternallyTargetedServers(ns, servers) {
 
 /** @param {NS} ns @param {number[]} pids @param {Record<string,any>} options */
 async function waitForPids(ns, pids, options) {
+    const results = createResultSummary();
     let nextRescan = Date.now() + options.rescan;
     while (pids.some((pid) => ns.isRunning(pid))) {
         await ns.sleep(options.poll);
+        drainWorkerReports(ns, results);
         if (Date.now() < nextRescan) continue;
         const rooted = rootServers(ns, discoverServers(ns));
         if (rooted > 0) {
@@ -1151,6 +1392,85 @@ async function waitForPids(ns, pids, options) {
         }
         nextRescan = Date.now() + options.rescan;
     }
+    drainWorkerReports(ns, results);
+    logResultSummary(ns, results);
+}
+
+function createResultSummary() {
+    return {
+        reports: 0,
+        hackAttempts: 0,
+        hackSuccesses: 0,
+        money: 0,
+        hackExp: 0,
+        growOperations: 0,
+        growExp: 0,
+        weakenOperations: 0,
+        security: 0,
+        weakenExp: 0,
+    };
+}
+
+/** @param {NS} ns @param {ReturnType<createResultSummary>} results */
+function drainWorkerReports(ns, results) {
+    while (true) {
+        const raw = ns.readPort(activeReportPort);
+        if (raw === "NULL PORT DATA") return;
+        if (typeof raw !== "string") continue;
+
+        let event;
+        try {
+            event = JSON.parse(raw);
+        } catch {
+            continue;
+        }
+        if (event?.marker !== REPORT_MARKER || event.session !== reportSession) continue;
+
+        results.reports++;
+        const exp = Math.max(0, Number(event.exp) || 0);
+        if (event.action === "hack") {
+            results.hackAttempts++;
+            results.hackSuccesses += event.success ? 1 : 0;
+            results.money += Math.max(0, Number(event.money) || 0);
+            results.hackExp += exp;
+        } else if (event.action === "grow") {
+            results.growOperations++;
+            results.growExp += exp;
+        } else if (event.action === "weaken") {
+            results.weakenOperations++;
+            results.security += Math.max(0, Number(event.security) || 0);
+            results.weakenExp += exp;
+        }
+    }
+}
+
+/** @param {NS} ns @param {ReturnType<createResultSummary>} results */
+function logResultSummary(ns, results) {
+    if (results.reports === 0) return;
+    const parts = [];
+    if (results.hackAttempts > 0) {
+        const failures = results.hackAttempts - results.hackSuccesses;
+        parts.push(
+            `HACK ${results.hackSuccesses}/${results.hackAttempts} exitosos` +
+            (failures > 0 ? ` (${failures} fallidos)` : "") +
+            `, $${ns.format.number(results.money, 2)}, EXP +${ns.format.number(results.hackExp, 2)}`,
+        );
+    }
+    if (results.growOperations > 0) {
+        parts.push(
+            `GROW ${results.growOperations} operaciones, ` +
+            `EXP +${ns.format.number(results.growExp, 2)}`,
+        );
+    }
+    if (results.weakenOperations > 0) {
+        parts.push(
+            `WEAKEN ${results.weakenOperations} operaciones, ` +
+            `seguridad -${results.security.toFixed(4)}, ` +
+            `EXP +${ns.format.number(results.weakenExp, 2)}`,
+        );
+    }
+    const totalExp = results.hackExp + results.growExp + results.weakenExp;
+    log(ns, `RESULTADO: ${parts.join(" | ")} | EXP total +${ns.format.number(totalExp, 2)}.`);
 }
 
 /** @param {NS} ns */
@@ -1206,6 +1526,7 @@ function validateOptions(ns, options) {
         "max-processes",
         "poll",
         "rescan",
+        "report-port",
     ];
     if (finiteOptions.some((name) => !Number.isFinite(Number(options[name])))) {
         ns.tprint("ERROR: las opciones numéricas deben contener números finitos.");
@@ -1219,6 +1540,11 @@ function validateOptions(ns, options) {
     options["max-processes"] = Math.max(4, Math.floor(Number(options["max-processes"])));
     options.poll = Math.max(50, Math.floor(Number(options.poll)));
     options.rescan = Math.max(1000, Math.floor(Number(options.rescan)));
+    options["report-port"] = Math.floor(Number(options["report-port"]));
+    if (options["report-port"] < 1 || options["report-port"] > 20) {
+        ns.tprint("ERROR: --report-port debe estar entre 1 y 20.");
+        return false;
+    }
     return true;
 }
 
@@ -1236,7 +1562,7 @@ function printHelp(ns) {
     ns.tprint(`Uso: run ${ns.getScriptName()} [opciones]`);
     ns.tprint("  --target HOST             Fija víctima; vacío selecciona automáticamente.");
     ns.tprint("  --strategy auto           auto, controller o batch.");
-    ns.tprint("  --home-ram-fraction 0.5   Parte de la RAM libre de home utilizable.");
+    ns.tprint("  --home-ram-fraction 0.75  Parte de la RAM libre de home utilizable.");
     ns.tprint("  --hack-fraction 0         0 optimiza automáticamente la fracción.");
     ns.tprint("  --max-hack-fraction 0.8   Límite de robo por cada hack del batch.");
     ns.tprint("  --money-threshold 0.999999 Dinero exigido para considerar preparado.");
@@ -1245,6 +1571,8 @@ function printHelp(ns) {
     ns.tprint("  --launch-buffer 1000      Tiempo para desplegar la oleada antes de aterrizar.");
     ns.tprint("  --max-batches 200         Protección contra exceso de procesos.");
     ns.tprint("  --max-processes 2000      Límite real de procesos por oleada.");
+    ns.tprint("  --report-port 20          Puerto reservado para resumir resultados.");
+    ns.tprint("  --fill-idle-ram true      Usa huecos de RAM con objetivos secundarios.");
     ns.tprint("  --avoid-busy-targets true Evita víctimas usadas por otros scripts.");
     ns.tprint("  --allow-conflicts false   Permite otros coordinadores (arriesgado).");
     ns.tprint("  --rescan 30000            Reintento de root mientras trabaja, en ms.");
