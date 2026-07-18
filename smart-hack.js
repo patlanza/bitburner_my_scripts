@@ -32,8 +32,7 @@ const FLAGS = [
     ["hack-fraction", 0.10],
     ["money-threshold", 0.95],
     ["security-buffer", 0.5],
-    ["use-home", false],
-    ["reserve-home", 16],
+    ["home-ram-fraction", 0.5],
     ["poll", 200],
     ["help", false],
 ];
@@ -72,7 +71,11 @@ export async function main(ns) {
         return;
     }
 
-    options["reserve-home"] = Math.max(0, options["reserve-home"]);
+    if (options["home-ram-fraction"] < 0 || options["home-ram-fraction"] > 1) {
+        ns.tprint("ERROR: --home-ram-fraction debe estar entre 0 y 1.");
+        return;
+    }
+
     options["security-buffer"] = Math.max(0, options["security-buffer"]);
     options.poll = Math.max(50, options.poll);
 
@@ -102,8 +105,7 @@ export async function main(ns) {
         const hosts = getExecutionHosts(
             ns,
             servers,
-            options["reserve-home"],
-            options["use-home"],
+            options["home-ram-fraction"],
         );
 
         if (!hasWorkerCapacity(ns, hosts)) {
@@ -115,7 +117,10 @@ export async function main(ns) {
         log(ns, `Servidores descubiertos: ${servers.size}`);
         log(ns, `Servidores con RAM utilizable: ${hosts.length}`);
         log(ns, `Objetivos disponibles: ${targets.length}`);
-        log(ns, `Uso de home: ${options["use-home"] ? "sí" : "no"}`);
+        log(
+            ns,
+            `Uso de RAM libre de home: ${ns.format.percent(options["home-ram-fraction"], 0)}`,
+        );
 
         const pids = [];
 
@@ -301,20 +306,19 @@ function chooseAction(ns, target, options) {
 /**
  * @param {NS} ns
  * @param {Set<string>} servers
- * @param {number} reserveHome
- * @param {boolean} useHome
+ * @param {number} homeRamFraction
  */
-function getExecutionHosts(ns, servers, reserveHome, useHome) {
+function getExecutionHosts(ns, servers, homeRamFraction) {
     const hosts = [];
 
     for (const host of servers) {
-        if (host === HOME && !useHome) continue;
-
         const server = ns.getServer(host);
         if (!server.hasAdminRights || server.maxRam <= 0) continue;
 
-        const reserve = host === HOME ? reserveHome : 0;
-        const freeRam = Math.max(0, server.maxRam - server.ramUsed - reserve);
+        const availableRam = Math.max(0, server.maxRam - server.ramUsed);
+        const freeRam = host === HOME
+            ? availableRam * homeRamFraction
+            : availableRam;
         if (freeRam > 0) hosts.push({ host, freeRam });
     }
 
@@ -407,8 +411,7 @@ function printHelp(ns) {
     ns.tprint("  --hack-fraction 0.10    Fracción de dinero robada por ciclo.");
     ns.tprint("  --money-threshold 0.95  Dinero mínimo antes de hackear.");
     ns.tprint("  --security-buffer 0.5   Margen sobre la seguridad mínima.");
-    ns.tprint("  --use-home              Permite utilizar también la RAM de home.");
-    ns.tprint("  --reserve-home 16       RAM reservada si se utiliza home, en GB.");
+    ns.tprint("  --home-ram-fraction 0.5 Fracción de la RAM libre de home que usará.");
     ns.tprint("  --poll 200              Intervalo de espera de workers, en ms.");
 }
 
