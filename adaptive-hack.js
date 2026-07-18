@@ -25,7 +25,7 @@ const LOG_STYLE_RULES = [
 
 const WORKERS = {
     hack: {
-        path: "/adaptive-hack-workers/hack.js",
+        path: "adaptive-hack-workers/hack.js",
         source: `/** @param {NS} ns */
 export async function main(ns) {
     const target = String(ns.args[0]);
@@ -39,7 +39,7 @@ export async function main(ns) {
 `,
     },
     grow: {
-        path: "/adaptive-hack-workers/grow.js",
+        path: "adaptive-hack-workers/grow.js",
         source: `/** @param {NS} ns */
 export async function main(ns) {
     const target = String(ns.args[0]);
@@ -53,7 +53,7 @@ export async function main(ns) {
 `,
     },
     weaken: {
-        path: "/adaptive-hack-workers/weaken.js",
+        path: "adaptive-hack-workers/weaken.js",
         source: `/** @param {NS} ns */
 export async function main(ns) {
     const target = String(ns.args[0]);
@@ -347,23 +347,14 @@ function discoverServers(ns) {
  */
 function getExecutionHosts(ns, servers, homeRamFraction) {
     const hosts = [];
-    const workerPaths = new Set(Object.values(WORKERS).map((worker) => worker.path));
     for (const host of servers) {
         const server = ns.getServer(host);
         if (!server.hasAdminRights || server.maxRam <= 0) continue;
         const availableRam = Math.max(0, server.maxRam - server.ramUsed);
         let freeRam = availableRam;
         if (host === HOME) {
-            const managedRam = ns.ps(HOME)
-                .filter((process) => workerPaths.has(process.filename))
-                .reduce(
-                    (total, process) =>
-                        total + ns.getScriptRam(process.filename, HOME) * process.threads,
-                    0,
-                );
-            const unmanagedRam = Math.max(0, server.ramUsed - managedRam);
-            const managedBudget = Math.max(0, server.maxRam - unmanagedRam) * homeRamFraction;
-            freeRam = Math.max(0, managedBudget - managedRam);
+            const absoluteLimit = server.maxRam * homeRamFraction;
+            freeRam = Math.max(0, absoluteLimit - server.ramUsed);
         }
         if (freeRam > 0) {
             const cpuCores = Math.max(1, server.cpuCores ?? 1);
