@@ -1,6 +1,28 @@
 const HOME = "home";
 const FORMULAS = "Formulas.exe";
 
+const ANSI = {
+    reset: "\u001b[0m",
+    boldRed: "\u001b[1;31m",
+    boldGreen: "\u001b[1;32m",
+    boldYellow: "\u001b[1;33m",
+    boldBlue: "\u001b[1;34m",
+    boldMagenta: "\u001b[1;35m",
+    boldCyan: "\u001b[1;36m",
+};
+
+const LOG_STYLE_RULES = [
+    [/^(CICLO \d+:)/, ANSI.boldCyan],
+    [/^(OBJETIVO:)/, ANSI.boldMagenta],
+    [/^(ROOT(?: durante ejecución)?:|LIMPIEZA:)/, ANSI.boldGreen],
+    [/^(ETAPA PREP:)/, ANSI.boldYellow],
+    [/^(ETAPA RELLENO:)/, ANSI.boldBlue],
+    [/^(ETAPA (?:SHOTGUN|PROTO-BATCH|CONTROLLER):)/, ANSI.boldGreen],
+    [/^(AVISO:|PREP incompleta:|Sin RAM|No hay ninguna víctima)/, ANSI.boldYellow],
+    [/^(BATCH \d+ incompleto|EXEC falló:|SCP falló|No se pudo iniciar)/, ANSI.boldRed],
+    [/^(Coordinador adaptativo iniciado\.)/, ANSI.boldCyan],
+];
+
 const WORKERS = {
     hack: {
         path: "/adaptive-hack-workers/hack.js",
@@ -1516,7 +1538,17 @@ function log(ns, message) {
     const time = [now.getHours(), now.getMinutes(), now.getSeconds()]
         .map((value) => String(value).padStart(2, "0"))
         .join(":");
-    ns.print(`[${time}] ${message}`);
+    ns.print(`[${time}] ${styleLogMessage(message)}`);
+}
+
+/** @param {string} message */
+function styleLogMessage(message) {
+    for (const [pattern, color] of LOG_STYLE_RULES) {
+        if (pattern.test(message)) {
+            return message.replace(pattern, `${color}$1${ANSI.reset}`);
+        }
+    }
+    return message;
 }
 
 /** @param {NS} ns */
