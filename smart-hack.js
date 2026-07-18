@@ -32,6 +32,7 @@ const FLAGS = [
     ["hack-fraction", 0.10],
     ["money-threshold", 0.95],
     ["security-buffer", 0.5],
+    ["use-home", false],
     ["reserve-home", 16],
     ["poll", 200],
     ["help", false],
@@ -91,46 +92,78 @@ export async function main(ns) {
         const rooted = rootServers(ns, servers);
         if (rooted > 0) log(ns, `ROOT: acceso obtenido en ${rooted} servidor(es).`);
 
-        const target = chooseTarget(ns, servers, String(options.target));
-        if (!target) {
+        const targets = chooseTargets(ns, servers, String(options.target));
+        if (targets.length === 0) {
             log(ns, "No hay ningún objetivo hackeable disponible.");
             await ns.sleep(5000);
             continue;
         }
 
-        const action = chooseAction(ns, target, options);
-        const hosts = getExecutionHosts(ns, servers, options["reserve-home"]);
-        const worker = WORKERS[action.name];
-        const workerRam = ns.getScriptRam(worker.path, HOME);
-        const capacity = hosts.reduce(
-            (total, host) => total + Math.floor(host.freeRam / workerRam),
-            0,
+        const hosts = getExecutionHosts(
+            ns,
+            servers,
+            options["reserve-home"],
+            options["use-home"],
         );
 
-        if (capacity < 1) {
+        if (!hasWorkerCapacity(ns, hosts)) {
             log(ns, "No hay RAM libre suficiente para ejecutar workers.");
             await ns.sleep(1000);
             continue;
         }
 
-        const requestedThreads = Math.max(1, Math.ceil(action.threads));
-        const threads = Math.min(requestedThreads, capacity);
-
         log(ns, `Servidores descubiertos: ${servers.size}`);
         log(ns, `Servidores con RAM utilizable: ${hosts.length}`);
-        log(ns, `Objetivo: ${target}`);
-        log(ns, `Acción: ${action.name}`);
-        log(ns, `Hilos: ${threads}/${requestedThreads} solicitados`);
-        log(ns, `Motivo: ${action.reason}`);
+        log(ns, `Objetivos disponibles: ${targets.length}`);
+        log(ns, `Uso de home: ${options["use-home"] ? "sí" : "no"}`);
 
-        const pids = await deployWorkers(
-            ns,
-            worker.path,
-            target,
-            threads,
-            hosts,
-            workerRam,
-        );
+        const pids = [];
+
+        // Atiende todos los objetivos por orden de rentabilidad. Cada
+        // despliegue descuenta la RAM del host para el siguiente objetivo.
+        for (const target of targets) {
+            const action = chooseAction(ns, target, options);
+            const worker = WORKERS[action.name];
+            const workerRam = ns.getScriptRam(worker.path, HOME);
+            const capacity = getThreadCapacity(hosts, workerRam);
+            if (capacity < 1) break;
+
+            const requested = Math.max(1, Math.ceil(action.threads));
+            const threads = Math.min(requested, capacity);
+            log(
+                ns,
+                `PLAN: ${target} -> ${action.name} con ${threads}/${requested} hilo(s). ${action.reason}`,
+            );
+
+            pids.push(...await deployWorkers(
+                ns,
+                worker.path,
+                target,
+                threads,
+                hosts,
+                workerRam,
+            ));
+        }
+
+        // Si todos los objetivos ya tienen sus hilos necesarios, usa la RAM
+        // remota restante para ganar experiencia sin quitar dinero adicional.
+        const weakenWorker = WORKERS.weaken;
+        const weakenRam = ns.getScriptRam(weakenWorker.path, HOME);
+        const spareThreads = getThreadCapacity(hosts, weakenRam);
+        if (spareThreads > 0) {
+            log(
+                ns,
+                `RAM sobrante: ${spareThreads} hilo(s) de weaken XP contra ${targets[0]}.`,
+            );
+            pids.push(...await deployWorkers(
+                ns,
+                weakenWorker.path,
+                targets[0],
+                spareThreads,
+                hosts,
+                weakenRam,
+            ));
+        }
 
         if (pids.length === 0) {
             log(ns, "No se pudo iniciar ningún worker; se reintentará.");
@@ -201,7 +234,7 @@ function rootServers(ns, servers) {
  * @param {Set<string>} servers
  * @param {string} requestedTarget
  */
-function chooseTarget(ns, servers, requestedTarget) {
+function chooseTargets(ns, servers, requestedTarget) {
     const hackingLevel = ns.getHackingLevel();
     const candidates = [];
 
@@ -223,12 +256,12 @@ function chooseTarget(ns, servers, requestedTarget) {
 
     if (requestedTarget) {
         return candidates.some((candidate) => candidate.host === requestedTarget)
-            ? requestedTarget
-            : "";
+            ? [requestedTarget]
+            : [];
     }
 
     candidates.sort((a, b) => b.score - a.score);
-    return candidates[0]?.host ?? "";
+    return candidates.map((candidate) => candidate.host);
 }
 
 /** @param {NS} ns @param {string} target @param {Record<string, any>} options */
@@ -269,11 +302,14 @@ function chooseAction(ns, target, options) {
  * @param {NS} ns
  * @param {Set<string>} servers
  * @param {number} reserveHome
+ * @param {boolean} useHome
  */
-function getExecutionHosts(ns, servers, reserveHome) {
+function getExecutionHosts(ns, servers, reserveHome, useHome) {
     const hosts = [];
 
     for (const host of servers) {
+        if (host === HOME && !useHome) continue;
+
         const server = ns.getServer(host);
         if (!server.hasAdminRights || server.maxRam <= 0) continue;
 
@@ -292,6 +328,24 @@ function getExecutionHosts(ns, servers, reserveHome) {
     });
 }
 
+/** @param {{host: string, freeRam: number}[]} hosts @param {number} workerRam */
+function getThreadCapacity(hosts, workerRam) {
+    return hosts.reduce(
+        (total, host) => total + Math.floor(host.freeRam / workerRam),
+        0,
+    );
+}
+
+/** @param {NS} ns @param {{host: string, freeRam: number}[]} hosts */
+function hasWorkerCapacity(ns, hosts) {
+    return Object.values(WORKERS).some(
+        (worker) => getThreadCapacity(
+            hosts,
+            ns.getScriptRam(worker.path, HOME),
+        ) > 0,
+    );
+}
+
 /**
  * @param {NS} ns
  * @param {string} script
@@ -304,10 +358,14 @@ async function deployWorkers(ns, script, target, requestedThreads, hosts, script
     const pids = [];
     let remaining = requestedThreads;
 
-    for (const { host, freeRam } of hosts) {
+    for (const hostInfo of hosts) {
         if (remaining <= 0) break;
 
-        const threads = Math.min(remaining, Math.floor(freeRam / scriptRam));
+        const host = hostInfo.host;
+        const threads = Math.min(
+            remaining,
+            Math.floor(hostInfo.freeRam / scriptRam),
+        );
         if (threads < 1) continue;
 
         if (host !== HOME && !await ns.scp(script, host, HOME)) {
@@ -323,7 +381,11 @@ async function deployWorkers(ns, script, target, requestedThreads, hosts, script
 
         pids.push(pid);
         remaining -= threads;
-        log(ns, `DESPLIEGUE: ${host} ejecuta ${script} con ${threads} hilo(s).`);
+        hostInfo.freeRam = Math.max(0, hostInfo.freeRam - threads * scriptRam);
+        log(
+            ns,
+            `DESPLIEGUE: ${host} ejecuta ${script} contra ${target} con ${threads} hilo(s).`,
+        );
     }
 
     return pids;
@@ -345,7 +407,8 @@ function printHelp(ns) {
     ns.tprint("  --hack-fraction 0.10    Fracción de dinero robada por ciclo.");
     ns.tprint("  --money-threshold 0.95  Dinero mínimo antes de hackear.");
     ns.tprint("  --security-buffer 0.5   Margen sobre la seguridad mínima.");
-    ns.tprint("  --reserve-home 16       RAM de home que no utilizará, en GB.");
+    ns.tprint("  --use-home              Permite utilizar también la RAM de home.");
+    ns.tprint("  --reserve-home 16       RAM reservada si se utiliza home, en GB.");
     ns.tprint("  --poll 200              Intervalo de espera de workers, en ms.");
 }
 
