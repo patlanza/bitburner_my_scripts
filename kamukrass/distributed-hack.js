@@ -46,8 +46,9 @@ const backdoorScript = "backdoor.js"
 const backdoorScriptRam = 5.8;
 
 // Solve Contract Script hooked in 
-const solveContractsScript = "solve-contracts.js";
+let solveContractsScript = "solve-contracts.js";
 const solveContractsScriptRam = 22;
+const solveContractsLogPort = 4;
 
 // global variable to track ongoing partial weak or grow attacks
 var partialWeakGrow = null; // do not change this
@@ -73,6 +74,7 @@ export async function main(ns) {
     growScriptName = `${folder}grow.js`;
     hackScriptName = `${folder}hack.js`;
     shareScriptName = `${folder}share.js`;
+    solveContractsScript = `${folder}solve-contracts.js`;
     files = [weakenScriptName, growScriptName, hackScriptName];
 
     // Disable default Logging
@@ -111,8 +113,13 @@ export async function main(ns) {
 
     var moneyXpShare = false
     var shareThreadIndex = 0;
+    const contractLogHandle = ns.getPortHandle(solveContractsLogPort);
+    const shownContractLogs = new Set();
+    var contractLaunchFailureLogged = false;
 
     while (true) {
+        forwardContractLogs(ns, contractLogHandle, shownContractLogs);
+
         // scan and nuke all accesible servers
         servers = await scanAndNuke(ns);
         // ns.print(`servers:${[...servers.values()]}`)
@@ -193,8 +200,12 @@ export async function main(ns) {
         const homeUsedRam = ns.getServerUsedRam("home")
         const homeFreeRam = homeMaxRam - homeUsedRam;
         if (homeFreeRam > solveContractsScriptRam) {
-            //ns.print("INFO checking for contracts to solve");
-            ns.exec(solveContractsScript, "home", 1);
+            const contractPid = ns.exec(solveContractsScript, "home", 1, solveContractsLogPort);
+            const alreadyRunning = ns.isRunning(solveContractsScript, "home", solveContractsLogPort);
+            if (contractPid === 0 && !alreadyRunning && !contractLaunchFailureLogged) {
+                ns.print(`[CONTRATOS] ERROR: no se pudo iniciar ${solveContractsScript} en home.`);
+                contractLaunchFailureLogged = true;
+            }
         }
 
         if (moneyXpShare && hackMoneyRatio >= 0.99) {
@@ -224,6 +235,17 @@ export async function main(ns) {
         //ns.print("INFO RAM utilization: " + Math.round(ramUsage * 100) + " % ");
 
         await ns.sleep(waitTimeBetweenManagementCycles);
+    }
+}
+
+function forwardContractLogs(ns, portHandle, shownMessages) {
+    while (!portHandle.empty()) {
+        const message = String(portHandle.read());
+        if (shownMessages.has(message)) {
+            continue;
+        }
+        shownMessages.add(message);
+        ns.print(`[CONTRATOS] ${message}`);
     }
 }
 

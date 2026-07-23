@@ -1,24 +1,46 @@
 // file: stock-trader.js
 
-// requires 4s Market Data TIX API Access
+// Requires TIX API Access + 4S Market Data TIX API Access.
 
-// defines if stocks can be shorted (see BitNode 8)
-const shortAvailable = true;
-
-const commission = 100000;
+// Shorting is normally only available in BitNode 8. Keep it disabled unless
+// you know that the current run allows short positions.
+const shortAvailable = false;
 
 export async function main(ns) {
     ns.disableLog("ALL");
+    if (!checkMarketAccess(ns)) return;
+    const commission = ns.stock.getConstants().StockMarketCommission;
 
     while (true) {
-        tendStocks(ns);
-        await ns.sleep(5 * 1000);
+        tendStocks(ns, commission);
+        await ns.stock.nextUpdate();
     }
 }
 
-function tendStocks(ns) {
+function checkMarketAccess(ns) {
+    const constants = ns.stock.getConstants();
+    if (!ns.stock.hasTixApiAccess()) {
+        ns.tprint(
+            `ERROR: falta TIX API Access. Coste: ` +
+            `$${ns.format.number(constants.TixApiCost, 2)}.`,
+        );
+        ns.tprint("Cómpralo desde la bolsa y vuelve a ejecutar el script.");
+        return false;
+    }
+    if (!ns.stock.has4SDataTixApi()) {
+        ns.tprint(
+            `ERROR: falta 4S Market Data TIX API Access. Coste: ` +
+            `$${ns.format.number(constants.MarketDataTixApi4SCost, 2)}.`,
+        );
+        ns.tprint("Este script necesita 4S para consultar forecast y volatilidad.");
+        return false;
+    }
+    return true;
+}
+
+function tendStocks(ns, commission) {
     ns.print("");
-    var stocks = getAllStocks(ns);
+    const stocks = getAllStocks(ns, commission);
 
     stocks.sort((a, b) => b.profitPotential - a.profitPotential);
 
@@ -30,23 +52,29 @@ function tendStocks(ns) {
         if (stock.longShares > 0) {
             if (stock.forecast > 0.5) {
                 longStocks.add(stock.sym);
-                ns.print(`INFO ${stock.summary} LONG ${ns.nFormat(stock.cost + stock.profit, "0.0a")} ${ns.nFormat(100 * stock.profit / stock.cost, "0.00")}%`);
+                ns.print(
+                    `INFO ${stock.summary} LONG ${formatMoney(ns, stock.cost + stock.profit)} ` +
+                    `${ns.format.percent(stock.cost > 0 ? stock.profit / stock.cost : 0, 2)}`,
+                );
                 overallValue += (stock.cost + stock.profit);
             }
             else {
-                const salePrice = ns.stock.sell(stock.sym, stock.longShares);
+                const salePrice = ns.stock.sellStock(stock.sym, stock.longShares);
                 const saleTotal = salePrice * stock.longShares;
                 const saleCost = stock.longPrice * stock.longShares;
                 const saleProfit = saleTotal - saleCost - 2 * commission;
                 stock.shares = 0;
                 shortStocks.add(stock.sym);
-                ns.print(`WARN ${stock.summary} SOLD for ${ns.nFormat(saleProfit, "$0.0a")} profit`);
+                ns.print(`WARN ${stock.summary} SOLD for ${formatMoney(ns, saleProfit)} profit`);
             }
         }
         if (stock.shortShares > 0) {
             if (stock.forecast < 0.5) {
                 shortStocks.add(stock.sym);
-                ns.print(`INFO ${stock.summary} SHORT ${ns.nFormat(stock.cost + stock.profit, "0.0a")} ${ns.nFormat(100 * stock.profit / stock.cost, "0.00")}%`);
+                ns.print(
+                    `INFO ${stock.summary} SHORT ${formatMoney(ns, stock.cost + stock.profit)} ` +
+                    `${ns.format.percent(stock.cost > 0 ? stock.profit / stock.cost : 0, 2)}`,
+                );
                 overallValue += (stock.cost + stock.profit);
             }
             else {
@@ -56,36 +84,46 @@ function tendStocks(ns) {
                 const saleProfit = saleTotal - saleCost - 2 * commission;
                 stock.shares = 0;
                 longStocks.add(stock.sym);
-                ns.print(`WARN ${stock.summary} SHORT SOLD for ${ns.nFormat(saleProfit, "$0.0a")} profit`);
+                ns.print(`WARN ${stock.summary} SHORT SOLD for ${formatMoney(ns, saleProfit)} profit`);
             }
         }
     }
 
     for (const stock of stocks) {
-        var money = ns.getServerMoneyAvailable("home");
+        const cash = ns.getServerMoneyAvailable("home");
         //ns.print(`INFO ${stock.summary}`);
         if (stock.forecast > 0.55) {
             longStocks.add(stock.sym);
             //ns.print(`INFO ${stock.summary}`);
-            if (money > 500 * commission) {
-                const sharesToBuy = Math.min(stock.maxShares, Math.floor((money - commission) / stock.askPrice));
-                if (ns.stock.buy(stock.sym, sharesToBuy) > 0) {
-                    ns.print(`WARN ${stock.summary} LONG BOUGHT ${ns.nFormat(sharesToBuy, "$0.0a")}`);
+            if (cash > 500 * commission) {
+                const sharesToBuy = Math.min(stock.maxShares, Math.floor((cash - commission) / stock.askPrice));
+                const availableShares = Math.max(
+                    0,
+                    stock.maxShares - stock.longShares - stock.shortShares,
+                );
+                const safeShares = Math.min(availableShares, sharesToBuy);
+                if (safeShares > 0 && ns.stock.buyStock(stock.sym, safeShares) > 0) {
+                    ns.print(`WARN ${stock.summary} LONG BOUGHT ${ns.format.number(safeShares, 0)} shares`);
                 }
             }
         }
         else if (stock.forecast < 0.45 && shortAvailable) {
             shortStocks.add(stock.sym);
             //ns.print(`INFO ${stock.summary}`);
-            if (money > 500 * commission) {
-                const sharesToBuy = Math.min(stock.maxShares, Math.floor((money - commission) / stock.bidPrice));
-                if (ns.stock.short(stock.sym, sharesToBuy) > 0) {
-                    ns.print(`WARN ${stock.summary} SHORT BOUGHT ${ns.nFormat(sharesToBuy, "$0.0a")}`);
+            if (cash > 500 * commission) {
+                const sharesToBuy = Math.min(stock.maxShares, Math.floor((cash - commission) / stock.bidPrice));
+                const availableShares = Math.max(
+                    0,
+                    stock.maxShares - stock.longShares - stock.shortShares,
+                );
+                const safeShares = Math.min(availableShares, sharesToBuy);
+                if (safeShares > 0 && ns.stock.buyShort(stock.sym, safeShares) > 0) {
+                    ns.print(`WARN ${stock.summary} SHORT BOUGHT ${ns.format.number(safeShares, 0)} shares`);
                 }
             }
         }
     }
-    ns.print("Stock value: " + ns.nFormat(overallValue, "$0.0a"));
+    ns.print("Stock value: " + formatMoney(ns, overallValue));
 
     // send stock market manipulation orders to hack manager
     var growStockPort = ns.getPortHandle(1); // port 1 is grow
@@ -94,16 +132,18 @@ function tendStocks(ns) {
         // only write to ports if empty
         for (const sym of longStocks) {
             //ns.print("INFO grow " + sym);
-            growStockPort.write(getSymServer(sym));
+            const server = getSymServer(sym);
+            if (server) growStockPort.write(server);
         }
         for (const sym of shortStocks) {
             //ns.print("INFO hack " + sym);
-            hackStockPort.write(getSymServer(sym));
+            const server = getSymServer(sym);
+            if (server) hackStockPort.write(server);
         }
     }
 }
 
-export function getAllStocks(ns) {
+export function getAllStocks(ns, commission = ns.stock.getConstants().StockMarketCommission) {
     // make a lookup table of all stocks and all their properties
     const stockSymbols = ns.stock.getSymbols();
     const stocks = [];
@@ -123,8 +163,12 @@ export function getAllStocks(ns) {
             maxShares: ns.stock.getMaxShares(sym),
         };
 
-        var longProfit = stock.longShares * (stock.bidPrice - stock.longPrice) - 2 * commission;
-        var shortProfit = stock.shortShares * (stock.shortPrice - stock.askPrice) - 2 * commission;
+        const longProfit = stock.longShares > 0
+            ? stock.longShares * (stock.bidPrice - stock.longPrice) - 2 * commission
+            : 0;
+        const shortProfit = stock.shortShares > 0
+            ? stock.shortShares * (stock.shortPrice - stock.askPrice) - 2 * commission
+            : 0;
         stock.profit = longProfit + shortProfit;
         stock.cost = (stock.longShares * stock.longPrice) + (stock.shortShares * stock.shortPrice)
 
@@ -178,4 +222,8 @@ function getSymServer(sym) {
 
     return symServer[sym];
 
+}
+
+function formatMoney(ns, value) {
+    return `$${ns.format.number(value, 1)}`;
 }
