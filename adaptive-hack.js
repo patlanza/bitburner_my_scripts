@@ -1,5 +1,8 @@
 const HOME = "home";
 const FORMULAS = "Formulas.exe";
+const CONTRACT_SCRIPT = "kamukrass/solve-contracts.js";
+const CONTRACT_LOG_PORT = 5;
+const CONTRACT_CHECK_INTERVAL = 30000;
 
 const ANSI = {
     reset: "\u001b[0m",
@@ -18,6 +21,8 @@ const LOG_STYLE_RULES = [
     [/^(ETAPA PREP:)/, ANSI.boldYellow],
     [/^(ETAPA RELLENO:)/, ANSI.boldBlue],
     [/^(ETAPA (?:SHOTGUN|PROTO-BATCH|CONTROLLER):)/, ANSI.boldGreen],
+    [/^(CONTRATOS ERROR:)/, ANSI.boldRed],
+    [/^(CONTRATOS:)/, ANSI.boldCyan],
     [/^(AVISO:|PREP incompleta:|Sin RAM|No hay ninguna víctima)/, ANSI.boldYellow],
     [/^(BATCH \d+ incompleto|EXEC falló:|SCP falló|No se pudo iniciar)/, ANSI.boldRed],
     [/^(Coordinador adaptativo iniciado\.)/, ANSI.boldCyan],
@@ -115,6 +120,8 @@ export async function main(ns) {
 
     ns.disableLog("ALL");
     await createWorkers(ns);
+    const contractState = createContractState(ns);
+    options.contractRamReserve = contractState.scriptRam;
     const conflicts = warnAboutOtherCoordinators(ns);
     if (conflicts > 0 && !options["allow-conflicts"]) {
         ns.tprint(
@@ -137,12 +144,18 @@ export async function main(ns) {
     log(ns, "Coordinador adaptativo iniciado.");
 
     while (true) {
+        serviceContracts(ns, options, contractState);
         cycle++;
         const servers = discoverServers(ns);
         const rooted = rootServers(ns, servers);
         if (rooted > 0) log(ns, `ROOT: acceso obtenido en ${rooted} servidor(es).`);
 
-        let hosts = getExecutionHosts(ns, servers, options["home-ram-fraction"]);
+        let hosts = getExecutionHosts(
+            ns,
+            servers,
+            options["home-ram-fraction"],
+            options.contractRamReserve,
+        );
         hosts = await prepareExecutionHosts(ns, hosts);
         const totalRam = hosts.reduce((sum, host) => sum + host.freeRam, 0);
         if (!hasWorkerCapacity(ns, hosts)) {
@@ -271,7 +284,63 @@ export async function main(ns) {
             continue;
         }
 
-        await maintainUtilization(ns, primaryPids, target, workerRam, options);
+        await maintainUtilization(ns, primaryPids, target, workerRam, options, contractState);
+    }
+}
+
+/** @param {NS} ns */
+function createContractState(ns) {
+    const scriptRam = ns.fileExists(CONTRACT_SCRIPT, HOME)
+        ? ns.getScriptRam(CONTRACT_SCRIPT, HOME)
+        : 0;
+    return {
+        scriptRam,
+        portHandle: ns.getPortHandle(CONTRACT_LOG_PORT),
+        shownMessages: new Set(),
+        nextCheck: 0,
+        launchErrorLogged: false,
+    };
+}
+
+/**
+ * Ejecuta el solucionador dentro del límite de RAM de home y reenvía sus
+ * resultados al tail permanente del coordinador.
+ * @param {NS} ns
+ * @param {Record<string,any>} options
+ * @param {{scriptRam:number,portHandle:any,shownMessages:Set<string>,nextCheck:number,launchErrorLogged:boolean}} state
+ */
+function serviceContracts(ns, options, state) {
+    while (!state.portHandle.empty()) {
+        const message = String(state.portHandle.read());
+        if (state.shownMessages.has(message)) continue;
+        state.shownMessages.add(message);
+        log(ns, `CONTRATOS: ${message}`);
+    }
+
+    const now = Date.now();
+    if (now < state.nextCheck) return;
+    state.nextCheck = now + CONTRACT_CHECK_INTERVAL;
+
+    if (state.scriptRam <= 0) {
+        if (!state.launchErrorLogged) {
+            log(ns, `CONTRATOS ERROR: no se encuentra ${CONTRACT_SCRIPT} en home.`);
+            state.launchErrorLogged = true;
+        }
+        return;
+    }
+
+    const homeRamLimit = ns.getServerMaxRam(HOME) * options["home-ram-fraction"];
+    const homeUsedRam = ns.getServerUsedRam(HOME);
+    if (homeUsedRam + state.scriptRam > homeRamLimit) {
+        state.nextCheck = now + 1000;
+        return;
+    }
+
+    const pid = ns.exec(CONTRACT_SCRIPT, HOME, 1, CONTRACT_LOG_PORT);
+    const alreadyRunning = ns.isRunning(CONTRACT_SCRIPT, HOME, CONTRACT_LOG_PORT);
+    if (pid === 0 && !alreadyRunning && !state.launchErrorLogged) {
+        log(ns, `CONTRATOS ERROR: no se pudo iniciar ${CONTRACT_SCRIPT} en home.`);
+        state.launchErrorLogged = true;
     }
 }
 
@@ -344,8 +413,9 @@ function discoverServers(ns) {
  * @param {NS} ns
  * @param {Set<string>} servers
  * @param {number} homeRamFraction
+ * @param {number} homeReserveRam
  */
-function getExecutionHosts(ns, servers, homeRamFraction) {
+function getExecutionHosts(ns, servers, homeRamFraction, homeReserveRam = 0) {
     const hosts = [];
     for (const host of servers) {
         const server = ns.getServer(host);
@@ -354,7 +424,7 @@ function getExecutionHosts(ns, servers, homeRamFraction) {
         let freeRam = availableRam;
         if (host === HOME) {
             const absoluteLimit = server.maxRam * homeRamFraction;
-            freeRam = Math.max(0, absoluteLimit - server.ramUsed);
+            freeRam = Math.max(0, absoluteLimit - server.ramUsed - homeReserveRam);
         }
         if (freeRam > 0) {
             const cpuCores = Math.max(1, server.cpuCores ?? 1);
@@ -1022,10 +1092,10 @@ async function runIdleFill(
 ) {
     if (processBudget < 1) return [];
     const hackingLevel = ns.getHackingLevel();
-    // Concentrar el relleno en los mejores secundarios evita que un objetivo
-    // muy lento retrase toda la siguiente reevaluacion del coordinador.
+    // Los objetivos libres se prefieren, pero los ocupados también pueden
+    // recibir relleno redundante. La víctima principal sigue siempre excluida.
     const targets = [...servers]
-        .filter((host) => host !== primaryTarget && !busyTargets.has(host))
+        .filter((host) => host !== primaryTarget)
         .map((host) => ns.getServer(host))
         .filter((server) =>
             server.hasAdminRights &&
@@ -1034,11 +1104,11 @@ async function runIdleFill(
         )
         .map((server) => ({
             ...server,
+            busy: busyTargets.has(server.hostname),
             score: server.moneyMax * Math.max(0.01, ns.hackAnalyzeChance(server.hostname)) /
                 Math.max(1, ns.getWeakenTime(server.hostname)),
         }))
-        .sort((a, b) => b.score - a.score)
-        .slice(0, 8);
+        .sort((a, b) => Number(a.busy) - Number(b.busy) || b.score - a.score);
     if (targets.length === 0) return [];
 
     const reservationsByTarget = new Map();
@@ -1049,35 +1119,55 @@ async function runIdleFill(
     let cursor = 0;
     let jobId = 0;
 
+    const reserveJob = (target, hostInfo, type, threads) => {
+        if (threads < 1 || plannedProcesses >= processBudget) return false;
+        const ram = threads * workerRam[type];
+        hostInfo.freeRam = Math.max(0, hostInfo.freeRam - ram);
+        usedRam += ram;
+        usedHosts.add(hostInfo.host);
+        usedTargets.add(target.hostname);
+        plannedProcesses++;
+
+        const reservation = reservationsByTarget.get(target.hostname) ?? [];
+        reservation.push({
+            operation: {
+                id: `fill-${jobId++}`,
+                type,
+                threads,
+                delay: 0,
+            },
+            allocations: [{ host: hostInfo.host, threads }],
+        });
+        reservationsByTarget.set(target.hostname, reservation);
+        return true;
+    };
+
     for (const hostInfo of hosts) {
-        let misses = 0;
-        while (plannedProcesses < processBudget && misses < targets.length) {
-            const target = targets[cursor++ % targets.length];
+        if (plannedProcesses >= processBudget) break;
+        const target = targets[cursor++ % targets.length];
+
+        // Una pequeña secuencia útil suele producir H-W-G o preparación. Se
+        // limita por host para que el primero no agote todo el presupuesto.
+        for (let usefulJobs = 0; usefulJobs < 3 && plannedProcesses < processBudget; usefulJobs++) {
             const job = planFillerJob(ns, target, hostInfo, workerRam, options);
-            if (!job) {
-                misses++;
-                continue;
+            if (!job) break;
+            reserveJob(target, hostInfo, job.type, job.threads);
+            const cheapestWorkerRam = Math.min(workerRam.hack, workerRam.grow, workerRam.weaken);
+            if (hostInfo.freeRam < cheapestWorkerRam) break;
+        }
+
+        // La RAM sobrante se usa para weaken redundante. No perjudica a la
+        // víctima y convierte capacidad que quedaría ociosa en experiencia.
+        if (plannedProcesses < processBudget) {
+            const weakenThreads = Math.floor(hostInfo.freeRam / workerRam.weaken);
+            if (weakenThreads > 0) {
+                reserveJob(target, hostInfo, "weaken", weakenThreads);
+                target.hackDifficulty = target.minDifficulty;
+            } else {
+                // Aprovecha también el pequeño fragmento que solo admita hack.
+                const hackThreads = Math.floor(hostInfo.freeRam / workerRam.hack);
+                if (hackThreads > 0) reserveJob(target, hostInfo, "hack", hackThreads);
             }
-
-            misses = 0;
-            const ram = job.threads * workerRam[job.type];
-            hostInfo.freeRam = Math.max(0, hostInfo.freeRam - ram);
-            usedRam += ram;
-            usedHosts.add(hostInfo.host);
-            usedTargets.add(target.hostname);
-            plannedProcesses++;
-
-            const reservation = reservationsByTarget.get(target.hostname) ?? [];
-            reservation.push({
-                operation: {
-                    id: `fill-${jobId++}`,
-                    type: job.type,
-                    threads: job.threads,
-                    delay: 0,
-                },
-                allocations: [{ host: hostInfo.host, threads: job.threads }],
-            });
-            reservationsByTarget.set(target.hostname, reservation);
         }
     }
 
@@ -1391,13 +1481,15 @@ function findBusyTargets(ns, servers, includeExternal = true) {
  * @param {string} primaryTarget
  * @param {Record<string,number>} workerRam
  * @param {Record<string,any>} options
+ * @param {{scriptRam:number,portHandle:any,shownMessages:Set<string>,nextCheck:number,launchErrorLogged:boolean}} contractState
  */
-async function maintainUtilization(ns, primaryPids, primaryTarget, workerRam, options) {
+async function maintainUtilization(ns, primaryPids, primaryTarget, workerRam, options, contractState) {
     let nextRescan = Date.now() + options.rescan;
     let nextRefill = Date.now() + options.refill;
     while (primaryPids.some((pid) => ns.isRunning(pid))) {
         await ns.sleep(options.poll);
         const now = Date.now();
+        serviceContracts(ns, options, contractState);
 
         if (options["fill-idle-ram"] && now >= nextRefill) {
             await refillIdleHosts(ns, primaryTarget, workerRam, options);
@@ -1417,7 +1509,12 @@ async function maintainUtilization(ns, primaryPids, primaryTarget, workerRam, op
 /** @param {NS} ns */
 async function refillIdleHosts(ns, primaryTarget, workerRam, options) {
     const servers = discoverServers(ns);
-    let hosts = getExecutionHosts(ns, servers, options["home-ram-fraction"]);
+    let hosts = getExecutionHosts(
+        ns,
+        servers,
+        options["home-ram-fraction"],
+        options.contractRamReserve,
+    );
     hosts = await prepareExecutionHosts(ns, hosts);
     if (!hasWorkerCapacity(ns, hosts)) return [];
 
