@@ -31,6 +31,14 @@ export async function main(ns) {
             headers.push("Hacknet Profit: ");
             values.push("$" + ns.format.number(hacknetTotalProfit, 1));
 
+            const stockMarketValue = getStockMarketValue(ns);
+            headers.push("Stock Market: ");
+            values.push(
+                stockMarketValue === null
+                    ? "Sin acceso TIX"
+                    : "$" + ns.format.number(stockMarketValue, 1),
+            );
+
             headers.push("Script Income: ");
             values.push("$" + ns.format.number(ns.getTotalScriptIncome()[0], 1) + "/s");
 
@@ -64,4 +72,22 @@ export async function main(ns) {
 
         await ns.sleep(1000);
     }
+}
+
+/** @param {NS} ns */
+function getStockMarketValue(ns) {
+    if (!ns.stock.hasTixApiAccess()) return null;
+
+    const commission = ns.stock.getConstants().StockMarketCommission;
+    let value = 0;
+    for (const symbol of ns.stock.getSymbols()) {
+        const [longShares, , shortShares, shortPrice] = ns.stock.getPosition(symbol);
+        if (longShares > 0) {
+            value += longShares * ns.stock.getBidPrice(symbol) - commission;
+        }
+        if (shortShares > 0) {
+            value += shortShares * (shortPrice * 2 - ns.stock.getAskPrice(symbol)) - commission;
+        }
+    }
+    return value;
 }

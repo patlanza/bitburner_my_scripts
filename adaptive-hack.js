@@ -3,6 +3,9 @@ const FORMULAS = "Formulas.exe";
 const CONTRACT_SCRIPT = "kamukrass/solve-contracts.js";
 const CONTRACT_LOG_PORT = 5;
 const CONTRACT_CHECK_INTERVAL = 30000;
+const GROW_STOCK_PORT = 1;
+const HACK_STOCK_PORT = 2;
+const EMPTY_STOCK_SIGNAL = "EMPTY";
 
 const ANSI = {
     reset: "\u001b[0m",
@@ -23,6 +26,7 @@ const LOG_STYLE_RULES = [
     [/^(ETAPA (?:SHOTGUN|PROTO-BATCH|CONTROLLER):)/, ANSI.boldGreen],
     [/^(CONTRATOS ERROR:)/, ANSI.boldRed],
     [/^(CONTRATOS:)/, ANSI.boldCyan],
+    [/^(BOLSA:)/, ANSI.boldMagenta],
     [/^(AVISO:|PREP incompleta:|Sin RAM|No hay ninguna víctima)/, ANSI.boldYellow],
     [/^(BATCH \d+ incompleto|EXEC falló:|SCP falló|No se pudo iniciar)/, ANSI.boldRed],
     [/^(Coordinador adaptativo iniciado\.)/, ANSI.boldCyan],
@@ -35,11 +39,12 @@ const WORKERS = {
 export async function main(ns) {
     const target = String(ns.args[0]);
     const landingTime = Number(ns.args[1]) || 0;
+    const manipulateStock = Boolean(ns.args[3]);
     const baseTime = ns.getHackTime(target);
     const additionalMsec = landingTime > 0
         ? Math.max(0, landingTime - Date.now() - baseTime)
         : 0;
-    await ns.hack(target, { additionalMsec });
+    await ns.hack(target, { additionalMsec, stock: manipulateStock });
 }
 `,
     },
@@ -49,11 +54,12 @@ export async function main(ns) {
 export async function main(ns) {
     const target = String(ns.args[0]);
     const landingTime = Number(ns.args[1]) || 0;
+    const manipulateStock = Boolean(ns.args[3]);
     const baseTime = ns.getGrowTime(target);
     const additionalMsec = landingTime > 0
         ? Math.max(0, landingTime - Date.now() - baseTime)
         : 0;
-    await ns.grow(target, { additionalMsec });
+    await ns.grow(target, { additionalMsec, stock: manipulateStock });
 }
 `,
     },
@@ -96,6 +102,9 @@ const FLAGS = [
 
 const deployedHosts = new Set([HOME]);
 let learnedLaunchMsPerProcess = 2;
+let stockGrowTargets = new Set();
+let stockHackTargets = new Set();
+let previousStockSignalSignature = "";
 
 /** @param {NS} ns */
 export async function main(ns) {
@@ -145,6 +154,7 @@ export async function main(ns) {
 
     while (true) {
         serviceContracts(ns, options, contractState);
+        updateStockManipulationTargets(ns);
         cycle++;
         const servers = discoverServers(ns);
         const rooted = rootServers(ns, servers);
@@ -1105,10 +1115,17 @@ async function runIdleFill(
         .map((server) => ({
             ...server,
             busy: busyTargets.has(server.hostname),
+            stockPriority:
+                stockGrowTargets.has(server.hostname) ||
+                stockHackTargets.has(server.hostname),
             score: server.moneyMax * Math.max(0.01, ns.hackAnalyzeChance(server.hostname)) /
                 Math.max(1, ns.getWeakenTime(server.hostname)),
         }))
-        .sort((a, b) => Number(a.busy) - Number(b.busy) || b.score - a.score);
+        .sort((a, b) =>
+            Number(b.stockPriority) - Number(a.stockPriority) ||
+            Number(a.busy) - Number(b.busy) ||
+            b.score - a.score
+        );
     if (targets.length === 0) return [];
 
     const reservationsByTarget = new Map();
@@ -1368,6 +1385,10 @@ async function launchReservation(ns, target, reservation, token, waveStart = nul
     let failures = 0;
     let timingMisses = 0;
     for (const { operation, allocations } of reservation) {
+        const manipulateStock =
+            operation.type === "grow"
+                ? stockGrowTargets.has(target)
+                : operation.type === "hack" && stockHackTargets.has(target);
         let part = 0;
         for (const allocation of allocations) {
             const baseTime = Math.max(0, operation.baseTime ?? 0);
@@ -1384,6 +1405,7 @@ async function launchReservation(ns, target, reservation, token, waveStart = nul
                 target,
                 landingTime,
                 `${token}-${operation.id}-${part++}`,
+                manipulateStock,
             );
             if (pid === 0) {
                 failures++;
@@ -1441,6 +1463,41 @@ function getMaxSingleProcessThreads(hosts, scriptRam) {
 }
 
 /**
+ * Consume las instantaneas que publica early-stock-trader. Un puerto vacio
+ * significa "sin actualizacion"; EMPTY significa que ya no hay posiciones.
+ * @param {NS} ns
+ */
+function updateStockManipulationTargets(ns) {
+    const growSnapshot = readStockTargetPort(ns.getPortHandle(GROW_STOCK_PORT));
+    const hackSnapshot = readStockTargetPort(ns.getPortHandle(HACK_STOCK_PORT));
+    if (growSnapshot !== null) stockGrowTargets = growSnapshot;
+    if (hackSnapshot !== null) stockHackTargets = hackSnapshot;
+    if (growSnapshot === null && hackSnapshot === null) return;
+
+    const signature =
+        `G:${[...stockGrowTargets].sort().join(",")}|` +
+        `H:${[...stockHackTargets].sort().join(",")}`;
+    if (signature === previousStockSignalSignature) return;
+    previousStockSignalSignature = signature;
+    log(
+        ns,
+        `BOLSA: ${stockGrowTargets.size} objetivo(s) para grow y ` +
+        `${stockHackTargets.size} para hack.`,
+    );
+}
+
+/** @param {NetscriptPort} port */
+function readStockTargetPort(port) {
+    if (port.empty()) return null;
+    const targets = new Set();
+    while (!port.empty()) {
+        const value = String(port.read());
+        if (value && value !== EMPTY_STOCK_SIGNAL) targets.add(value);
+    }
+    return targets;
+}
+
+/**
  * Las victimas de relleno propias siempre se protegen mientras sigan activas.
  * Los procesos ajenos solo se incluyen cuando avoid-busy-targets esta activo.
  * @param {NS} ns
@@ -1490,6 +1547,7 @@ async function maintainUtilization(ns, primaryPids, primaryTarget, workerRam, op
         await ns.sleep(options.poll);
         const now = Date.now();
         serviceContracts(ns, options, contractState);
+        updateStockManipulationTargets(ns);
 
         if (options["fill-idle-ram"] && now >= nextRefill) {
             await refillIdleHosts(ns, primaryTarget, workerRam, options);
